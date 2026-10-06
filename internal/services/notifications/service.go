@@ -22,12 +22,14 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/autobrr/qui/internal/models"
-	"github.com/autobrr/qui/pkg/redact"
 )
 
 const (
 	defaultQueueSize = 100
-	defaultWorkers   = 2
+	// enqueueTimeout bounds how long a lifecycle event waits for a congested
+	// ingress queue. After it, the rejection is logged with the run identity
+	// instead of the event vanishing the way a silent drop would.
+	enqueueTimeout = 30 * time.Second
 )
 
 type Notifier interface {
@@ -81,7 +83,26 @@ type Service struct {
 	instanceStore *models.InstanceStore
 	logger        zerolog.Logger
 	queue         chan Event
-	startOnce     sync.Once
+
+	// ingressMu makes "accepting?" and the channel send a single handshake:
+	// once shutdown flips accepting under the lock, every send that held the
+	// lock already committed to the queue, so the shutdown drain reads every
+	// accepted event exactly once.
+	ingressMu sync.Mutex
+	accepting bool
+
+	// lanes belongs to the router goroutine; laneIdle is the workers'
+	// retirement handshake back to it. wg covers the router, lane workers and
+	// unkeyed one-off deliveries so Shutdown can wait for accepted events to
+	// reach a logged per-target outcome.
+	lanes    map[string]*targetLane
+	laneIdle chan *targetLane
+	stopped  chan struct{}
+	routed   chan struct{}
+	wg       sync.WaitGroup
+
+	startOnce sync.Once
+	stopOnce  sync.Once
 }
 
 func NewService(store *models.NotificationTargetStore, instanceStore *models.InstanceStore, logger zerolog.Logger) *Service {
@@ -94,6 +115,11 @@ func NewService(store *models.NotificationTargetStore, instanceStore *models.Ins
 		instanceStore: instanceStore,
 		logger:        logger,
 		queue:         make(chan Event, defaultQueueSize),
+		accepting:     true,
+		lanes:         make(map[string]*targetLane),
+		laneIdle:      make(chan *targetLane),
+		stopped:       make(chan struct{}),
+		routed:        make(chan struct{}),
 	}
 }
 
@@ -112,12 +138,26 @@ func (s *Service) Start(ctx context.Context) {
 	}
 
 	s.startOnce.Do(func() {
-		for range defaultWorkers {
-			go s.worker(ctx)
+		s.wg.Add(1)
+		go s.runRouter()
+
+		if ctx != nil {
+			go func() {
+				select {
+				case <-ctx.Done():
+					s.beginShutdown()
+				case <-s.stopped:
+				}
+			}()
 		}
 	})
 }
 
+// Notify fans a lifecycle event out to every enabled target that subscribes to
+// its type. Events for the same run or resource leave in order at each target;
+// different runs send in parallel. The call only blocks when the ingress queue
+// is congested, and a rejected event is logged with its run identity rather
+// than dropped without a trace.
 func (s *Service) Notify(ctx context.Context, event Event) {
 	if s == nil || s.store == nil {
 		return
@@ -127,17 +167,75 @@ func (s *Service) Notify(ctx context.Context, event Event) {
 	}
 
 	if s.queue == nil {
-		go s.dispatch(ctx, event)
+		go s.dispatchWithoutRouter(event)
 		return
 	}
 
-	select {
-	case <-ctx.Done():
+	timer := time.NewTimer(enqueueTimeout)
+	defer timer.Stop()
+
+	// Hold ingressMu across the send so shutdown can never race a committed
+	// queue entry past its single drain pass. A blocked send here applies
+	// backpressure to other producers until the router makes room.
+	s.ingressMu.Lock()
+	if !s.accepting {
+		s.ingressMu.Unlock()
+		s.logIngressRejection(event, "service stopped", nil)
 		return
-	case s.queue <- event:
-	default:
-		s.logger.Warn().Str("event", string(event.Type)).Msg("notifications: queue full, dropping event")
 	}
+	select {
+	case s.queue <- event:
+		s.ingressMu.Unlock()
+	case <-ctx.Done():
+		s.ingressMu.Unlock()
+		s.logIngressRejection(event, "caller canceled while the notification queue was congested", ctx.Err())
+	case <-timer.C:
+		s.ingressMu.Unlock()
+		s.logIngressRejection(event, "notification queue congested for "+enqueueTimeout.String(), nil)
+	}
+}
+
+// Shutdown stops accepting events, routes every event already accepted, and
+// waits for their per-target deliveries until ctx expires. It is safe to call
+// without Start.
+func (s *Service) Shutdown(ctx context.Context) error {
+	if s == nil || s.queue == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.beginShutdown()
+
+	finished := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+		return nil
+	case <-ctx.Done():
+		return errors.New("notifications: timed out waiting for queued notifications to finish sending")
+	}
+}
+
+func (s *Service) beginShutdown() {
+	s.stopOnce.Do(func() {
+		s.ingressMu.Lock()
+		s.accepting = false
+		s.ingressMu.Unlock()
+		close(s.stopped)
+	})
+}
+
+func (s *Service) logIngressRejection(event Event, reason string, cause error) {
+	logEventContext(s.logger.Error(), event).
+		Err(cause).
+		Str("reason", reason).
+		Msg("notifications: lifecycle event not delivered to any target")
 }
 
 func (s *Service) SendTest(ctx context.Context, target *models.NotificationTarget, title, message string) error {
@@ -154,49 +252,6 @@ func (s *Service) SendTest(ctx context.Context, target *models.NotificationTarge
 	}
 
 	return s.send(ctx, target, event, title, message)
-}
-
-func (s *Service) worker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case event := <-s.queue:
-			s.dispatch(ctx, event)
-		}
-	}
-}
-
-func (s *Service) dispatch(ctx context.Context, event Event) {
-	if s == nil || s.store == nil {
-		return
-	}
-
-	targets, err := s.store.ListEnabled(ctx)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("notifications: failed to list targets")
-		return
-	}
-	if len(targets) == 0 {
-		return
-	}
-
-	for _, target := range targets {
-		if !allowsEvent(target.EventTypes, event.Type) {
-			continue
-		}
-
-		title, message := s.formatEvent(ctx, event, targetScheme(target.URL) != "notifiarrapi")
-		if strings.TrimSpace(message) == "" {
-			continue
-		}
-
-		if err := s.send(ctx, target, event, title, message); err != nil {
-			// Redact: shoutrrr errors embed the post URL, which carries the
-			// webhook token / bot token for most services.
-			s.logger.Error().Str("error", redact.String(err.Error())).Str("target", target.Name).Str("event", string(event.Type)).Msg("notifications: send failed")
-		}
-	}
 }
 
 func (s *Service) send(ctx context.Context, target *models.NotificationTarget, event Event, title, message string) error {

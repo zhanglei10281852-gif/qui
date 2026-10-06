@@ -1022,6 +1022,14 @@ func (app *Application) runServer() {
 			return err
 		}
 
+		// Let lifecycle notifications already accepted (run start/progress/
+		// completion) finish sending before the process exits.
+		notifyCtx, notifyCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer notifyCancel()
+		if err := notificationService.Shutdown(notifyCtx); err != nil {
+			log.Warn().Err(err).Msg("timed out waiting for queued notifications to finish sending")
+		}
+
 		// Closed here because os.Exit below means a defer would never fire. A
 		// job's next read gets ErrConnectionLost with ErrPoolClosed in its
 		// chain, a read in flight gets ErrConnectionLost, and either ends with
