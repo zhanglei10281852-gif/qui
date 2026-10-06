@@ -9,4 +9,4 @@ Rubric ID：4｜状态：通过｜期望行为：事件过滤、默认消息格�
 Rubric ID：5｜状态：通过｜期望行为：队列拥塞时生命周期事件不会无提示消失，日志或 API 给出确定的接受、投递或丢弃结果。｜实际观察：Notify 对有界 ingress queue 使用 30 秒定时器和调用方 context；服务停止、调用方取消或队列超时均写入带事件标识的 lifecycle event not delivered to any target 日志；已接受事件由 Shutdown 排空并等待投递。｜直接证据：internal/services/notifications/service.go:161-237；internal/services/notifications/dispatcher.go:runRouter、drainIngress；internal/services/notifications/service_dispatch_test.go:TestShutdownDeliversEveryAcceptedEvent、TestNotifyAfterShutdownDeliversNothing。
 Rubric ID：6｜状态：通过｜期望行为：备份、目录扫描、孤儿扫描和自动化的真实事件都得到可验证的顺序与目标隔离结果。｜实际观察：eventLaneKey 覆盖 backup、dirscan、orphanscan、crossseed、torrent 和 automation 事件；lane 由 targetID 与资源/运行键隔离，race 测试和 lane key 表格测试通过。｜直接证据：internal/services/notifications/dispatcher.go:eventLaneKey；internal/services/notifications/service_dispatch_test.go:TestEventLaneKey；go test -race -count=1 ./internal/services/notifications 通过。
 
-完成度：完成｜收录：难题
+完成度：完成｜收录：不收录
