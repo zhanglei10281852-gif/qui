@@ -29,8 +29,8 @@ func TestSwitchableWriter_Write(t *testing.T) {
 	if len(history) != 1 {
 		t.Errorf("expected 1 line in hub, got %d", len(history))
 	}
-	if history[0] != "hello world" {
-		t.Errorf("expected 'hello world', got %q", history[0])
+	if history[0].Line != "hello world" {
+		t.Errorf("expected 'hello world', got %q", history[0].Line)
 	}
 }
 
@@ -50,9 +50,9 @@ func TestSwitchableWriter_MultipleLines(t *testing.T) {
 	}
 
 	expected := []string{"line1", "line2", "line3"}
-	for i, line := range history {
-		if line != expected[i] {
-			t.Errorf("expected %q, got %q", expected[i], line)
+	for i, entry := range history {
+		if entry.Line != expected[i] {
+			t.Errorf("expected %q, got %q", expected[i], entry.Line)
 		}
 	}
 }
@@ -84,8 +84,8 @@ func TestSwitchableWriter_PartialLines(t *testing.T) {
 	if len(history) != 1 {
 		t.Errorf("expected 1 line, got %d", len(history))
 	}
-	if history[0] != "partial complete" {
-		t.Errorf("expected 'partial complete', got %q", history[0])
+	if history[0].Line != "partial complete" {
+		t.Errorf("expected 'partial complete', got %q", history[0].Line)
 	}
 }
 

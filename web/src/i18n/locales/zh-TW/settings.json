@@ -389,7 +389,14 @@
       "maxLive": "即時最大值",
       "maxPaused": "暫停時最大值",
       "oldestEntriesDropped": "· 最早的條目已丟棄",
-      "muteSimilarEntries": "靜音類似條目"
+      "muteSimilarEntries": "靜音類似條目",
+      "reconnecting": "連線中斷，正在重新連線…",
+      "streamGap": "日誌串流落後，正在重新連線以從最後位置繼續…",
+      "streamReset": "日誌串流已重設（{{reason}}）；已重新載入最近日誌，較早的項目可能無法取得。",
+      "reasonRestart": "伺服器已重新啟動",
+      "reasonCursorExpired": "最後位置過舊",
+      "reasonCursorAhead": "最後位置超前於伺服器",
+      "reasonInvalidCursor": "無法辨識最後的位置"
     },
     "entryDialog": {
       "title": "日誌條目",

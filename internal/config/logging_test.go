@@ -39,7 +39,7 @@ func TestLogWriterKeepsFileAndHubWhenStderrFails(t *testing.T) {
 	got, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	require.Equal(t, "first\nsecond\n", string(got))
-	require.Equal(t, []string{"first", "second"}, hub.History(10))
+	require.Equal(t, []string{"first", "second"}, hubLines(hub))
 }
 
 func TestLogWriterKeepsHubWithoutFileWhenStderrFails(t *testing.T) {
@@ -50,5 +50,14 @@ func TestLogWriterKeepsHubWithoutFileWhenStderrFails(t *testing.T) {
 	hub := logstream.NewHub(10)
 	_, err = logstream.NewSwitchableWriter(writer, hub).Write([]byte("only\n"))
 	require.NoError(t, err)
-	require.Equal(t, []string{"only"}, hub.History(10))
+	require.Equal(t, []string{"only"}, hubLines(hub))
+}
+
+func hubLines(hub *logstream.Hub) []string {
+	entries := hub.History(10)
+	lines := make([]string, len(entries))
+	for i, entry := range entries {
+		lines[i] = entry.Line
+	}
+	return lines
 }

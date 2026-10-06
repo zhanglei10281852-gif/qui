@@ -391,7 +391,14 @@
       "maxLive": "max",
       "maxPaused": "max while paused",
       "oldestEntriesDropped": "• oldest entries dropped",
-      "muteSimilarEntries": "Mute similar entries"
+      "muteSimilarEntries": "Mute similar entries",
+      "reconnecting": "Reconnecting…",
+      "streamGap": "Log stream fell behind; reconnecting to resume from the last position…",
+      "streamReset": "Log stream reset ({{reason}}); recent logs were reloaded and older entries may be unavailable.",
+      "reasonRestart": "server restarted",
+      "reasonCursorExpired": "last position is too old",
+      "reasonCursorAhead": "last position is ahead of the server",
+      "reasonInvalidCursor": "last position was not recognized"
     },
     "entryDialog": {
       "title": "Log Entry",

@@ -2706,9 +2706,15 @@ class ApiClient {
     })
   }
 
-  // Get the SSE log stream URL for EventSource
-  getLogStreamUrl(limit = 1000): string {
-    return `${API_BASE}/logs/stream?limit=${limit}`
+  // Get the SSE log stream URL for EventSource. after is the cursor
+  // ("<epoch>-<sequence>") of the last received line, used to resume without
+  // duplicates after an explicit reconnect; browsers also send Last-Event-ID.
+  getLogStreamUrl(limit = 1000, after?: string): string {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (after) {
+      params.set("after", after)
+    }
+    return `${API_BASE}/logs/stream?${params.toString()}`
   }
 
   async getLogFiles(): Promise<LogFile[]> {

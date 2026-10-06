@@ -34,6 +34,7 @@ import { useDateTimeFormatters } from "@/hooks/useDateTimeFormatters"
 import { usePersistedLogExclusions } from "@/hooks/usePersistedLogExclusions"
 import { ALL_LEVELS_SET, ALL_LOG_LEVELS, usePersistedLogLevels, type LogLevel } from "@/hooks/usePersistedLogLevels"
 import { api } from "@/lib/api"
+import { parseLogCursor, parseStreamSignal, shouldAppendLine, type LogCursor, type LogStreamSignal } from "@/lib/log-stream"
 import { copyTextToClipboard, formatBytes } from "@/lib/utils"
 import type { LogSettingsUpdate } from "@/types"
 import { useForm } from "@tanstack/react-form"
@@ -41,6 +42,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { AlertCircle, ChevronDown, Copy, Download, FileText, Filter, Loader2, Lock, Search, Settings, X } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
+import type { TFunction } from "i18next"
 import { toast } from "sonner"
 
 const LOG_LEVELS = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] as const
@@ -252,12 +254,12 @@ function LogSettingsForm() {
 }
 
 interface RawLogLine {
-  id: number
+  id: string
   text: string
 }
 
 interface ParsedLogEntry {
-  id: number
+  id: string
   level: LogLevel
   time: string
   message: string
@@ -518,22 +520,36 @@ function LogEntryDialog({
 const LOG_SOFT_CAP = 1000
 const LOG_HARD_CAP = 10000
 
+// resetReasonText maps a server "reset" event reason to translated text.
+function resetReasonText(reason: string, t: TFunction): string {
+  switch (reason) {
+    case "restart":
+      return t("logs.viewer.reasonRestart")
+    case "cursor_expired":
+      return t("logs.viewer.reasonCursorExpired")
+    case "cursor_ahead":
+      return t("logs.viewer.reasonCursorAhead")
+    default:
+      return t("logs.viewer.reasonInvalidCursor")
+  }
+}
+
 function LiveLogViewer({ configPath }: { configPath?: string }) {
   const { t } = useTranslation("settings")
   const { formatTimeOnly } = useDateTimeFormatters()
   const [lines, setLines] = useState<RawLogLine[]>([])
   const [autoScroll, setAutoScroll] = useState(true)
   const [isConnected, setIsConnected] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [streamNotice, setStreamNotice] = useState<LogStreamSignal | null>(null)
   const [selectedLevels, setSelectedLevels] = usePersistedLogLevels()
   const [searchQuery, setSearchQuery] = useState("")
   const [droppedWhilePaused, setDroppedWhilePaused] = useState(false)
   const [selectedEntry, setSelectedEntry] = useState<ParsedLogEntry | null>(null)
   const [logExclusions, setLogExclusions] = usePersistedLogExclusions()
   const scrollRef = useRef<HTMLDivElement>(null)
-  const eventSourceRef = useRef<EventSource | null>(null)
-  const reconnectTimeoutRef = useRef<number | null>(null)
-  const nextIdRef = useRef(0)
+  // Cursor of the last accepted line; resume point for reconnects and the
+  // dedupe boundary for history replays.
+  const lastCursorRef = useRef<LogCursor | null>(null)
   const autoScrollRef = useRef(autoScroll)
 
   // Keep ref in sync for use in event handler
@@ -545,27 +561,34 @@ function LiveLogViewer({ configPath }: { configPath?: string }) {
     }
   }, [autoScroll])
 
-  const connect = useCallback(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close()
-    }
-    if (reconnectTimeoutRef.current !== null) {
-      window.clearTimeout(reconnectTimeoutRef.current)
-      reconnectTimeoutRef.current = null
-    }
-
-    setError(null)
-    const url = api.getLogStreamUrl(1000)
-    const es = new EventSource(url, { withCredentials: true })
-    eventSourceRef.current = es
+  useEffect(() => {
+    // A fresh mount has no lines yet, so start without a cursor and take the
+    // server's history snapshot. After network drops the browser keeps the
+    // EventSource alive and reconnects automatically, resending the last
+    // cursor as Last-Event-ID, so history is neither duplicated nor missed.
+    const es = new EventSource(api.getLogStreamUrl(LOG_SOFT_CAP), { withCredentials: true })
 
     es.onopen = () => {
       setIsConnected(true)
-      setError(null)
+      // A gap is healed once the replacement connection is open; reset
+      // notices clear when the reloaded history starts arriving.
+      setStreamNotice((prev) => (prev?.kind === "gap" ? null : prev))
     }
 
     es.onmessage = (event) => {
-      const newEntry: RawLogLine = { id: nextIdRef.current++, text: event.data as string }
+      const cursor = parseLogCursor(event.lastEventId)
+      if (!cursor) {
+        return
+      }
+      // Defensive: the server already promises strictly newer cursors, but
+      // never append a replayed cursor twice.
+      if (!shouldAppendLine(cursor, lastCursorRef.current)) {
+        return
+      }
+      lastCursorRef.current = cursor
+      setStreamNotice((prev) => (prev?.kind === "reset" ? null : prev))
+
+      const newEntry: RawLogLine = { id: event.lastEventId, text: event.data as string }
       setLines((prev) => {
         const newLines = [...prev, newEntry]
         // Soft cap when auto-scroll ON (user following live)
@@ -581,26 +604,37 @@ function LiveLogViewer({ configPath }: { configPath?: string }) {
       })
     }
 
+    // Cursor cannot be honoured (server restart, position expired/invalid):
+    // discard the old view; the fresh history snapshot that follows is truth.
+    es.addEventListener("reset", (event) => {
+      const signal = parseStreamSignal("reset", (event as MessageEvent).data as string)
+      if (!signal) {
+        return
+      }
+      lastCursorRef.current = null
+      setLines([])
+      setDroppedWhilePaused(false)
+      setStreamNotice(signal)
+    })
+
+    // Subscriber fell behind server-side: the stream ends and EventSource
+    // reconnects from the last cursor; observe it instead of losing lines.
+    es.addEventListener("gap", (event) => {
+      const signal = parseStreamSignal("gap", (event as MessageEvent).data as string)
+      if (signal) {
+        setStreamNotice(signal)
+      }
+    })
+
     es.onerror = () => {
+      // Do not close: native retry reconnects with Last-Event-ID.
       setIsConnected(false)
-      setError("Connection lost. Reconnecting...")
+    }
+
+    return () => {
       es.close()
-      reconnectTimeoutRef.current = window.setTimeout(connect, 3000)
     }
   }, [])
-
-  useEffect(() => {
-    connect()
-    return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close()
-      }
-      if (reconnectTimeoutRef.current !== null) {
-        window.clearTimeout(reconnectTimeoutRef.current)
-        reconnectTimeoutRef.current = null
-      }
-    }
-  }, [connect])
 
   // Parse entries once when lines change (avoid re-parsing on filter/search changes)
   const parsedEntries = useMemo(() => lines.map(parseLogLine), [lines])
@@ -676,10 +710,22 @@ function LiveLogViewer({ configPath }: { configPath?: string }) {
           <span className="text-sm text-muted-foreground">
             {isConnected ? t("logs.viewer.connected") : t("logs.viewer.disconnected")}
           </span>
-          {error && (
+          {!isConnected && (
             <span className="flex items-center gap-1 text-sm text-yellow-500">
               <AlertCircle className="h-3 w-3" />
-              {error}
+              {t("logs.viewer.reconnecting")}
+            </span>
+          )}
+          {streamNotice?.kind === "reset" && (
+            <span className="flex items-center gap-1 text-sm text-yellow-500">
+              <AlertCircle className="h-3 w-3" />
+              {t("logs.viewer.streamReset", { reason: resetReasonText(streamNotice.reason, t) })}
+            </span>
+          )}
+          {streamNotice?.kind === "gap" && (
+            <span className="flex items-center gap-1 text-sm text-yellow-500">
+              <AlertCircle className="h-3 w-3" />
+              {t("logs.viewer.streamGap")}
             </span>
           )}
         </div>

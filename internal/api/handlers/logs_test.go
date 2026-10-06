@@ -10,13 +10,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/autobrr/qui/internal/config"
+	"github.com/autobrr/qui/internal/logstream"
 )
 
 func TestLogsHandler_GetLogSettings(t *testing.T) {
@@ -211,6 +214,327 @@ func TestLogsHandler_StreamLogs_EndsOnShutdown(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("log stream did not end on shutdown")
+	}
+}
+
+// sseFrame is a parsed SSE block separated by blank lines.
+type sseFrame struct {
+	id    string
+	event string
+	data  string
+}
+
+func parseSSEFrames(body string) []sseFrame {
+	var frames []sseFrame
+	for _, block := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n\n") {
+		var frame sseFrame
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "id: "):
+				frame.id = strings.TrimPrefix(line, "id: ")
+			case strings.HasPrefix(line, "event: "):
+				frame.event = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				frame.data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if frame.id != "" || frame.event != "" || frame.data != "" {
+			frames = append(frames, frame)
+		}
+	}
+	return frames
+}
+
+func TestLogsHandler_StreamLogs_FramesCarryCursors(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig, nil)
+	hub := handler.GetHub()
+	hub.Write("line one")
+	hub.Write("line two")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodGet, "/logs/stream?limit=10", http.NoBody).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop within timeout")
+	}
+
+	frames := parseSSEFrames(rec.Body.String())
+	var dataFrames []sseFrame
+	for _, frame := range frames {
+		if frame.event == "" {
+			dataFrames = append(dataFrames, frame)
+		}
+	}
+	if len(dataFrames) != 2 {
+		t.Fatalf("expected 2 log frames, got %d: %+v", len(dataFrames), frames)
+	}
+	for i, frame := range dataFrames {
+		cursor, ok := logstream.ParseCursor(frame.id)
+		if !ok {
+			t.Fatalf("frame %d has invalid cursor %q", i, frame.id)
+		}
+		if cursor.Epoch != hub.Epoch() {
+			t.Fatalf("frame %d has foreign epoch %q", i, cursor.Epoch)
+		}
+		if cursor.Seq != uint64(i+1) {
+			t.Fatalf("frame %d has seq %d, want %d", i, cursor.Seq, i+1)
+		}
+	}
+	if dataFrames[0].data != "line one" || dataFrames[1].data != "line two" {
+		t.Fatalf("unexpected payloads: %q, %q", dataFrames[0].data, dataFrames[1].data)
+	}
+}
+
+func TestLogsHandler_StreamLogs_ResumeFromCursor(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig, nil)
+	hub := handler.GetHub()
+	for i := range 20 {
+		hub.Write("line " + strconv.Itoa(i+1))
+	}
+
+	// Reconnect claiming delivery through seq 10: only 11..20 may be replayed.
+	after := (logstream.Cursor{Epoch: hub.Epoch(), Seq: 10}).String()
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodGet, "/logs/stream?limit=100&after="+after, http.NoBody).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	// A line written while live follows the replay without a gap or dup.
+	time.Sleep(50 * time.Millisecond)
+	hub.Write("line 21")
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop within timeout")
+	}
+
+	var seqs []uint64
+	var data []string
+	for _, frame := range parseSSEFrames(rec.Body.String()) {
+		if frame.event != "" {
+			t.Fatalf("unexpected control event %q on resume", frame.event)
+		}
+		cursor, ok := logstream.ParseCursor(frame.id)
+		if !ok {
+			t.Fatalf("invalid cursor %q", frame.id)
+		}
+		seqs = append(seqs, cursor.Seq)
+		data = append(data, frame.data)
+	}
+	if len(seqs) != 11 {
+		t.Fatalf("expected seq 11..21 (11 frames), got %d: %v", len(seqs), seqs)
+	}
+	for i, seq := range seqs {
+		if seq != uint64(11+i) {
+			t.Fatalf("frame %d: expected seq %d, got %d (gap or duplicate)", i, 11+i, seq)
+		}
+	}
+	if data[0] != "line 11" || data[10] != "line 21" {
+		t.Fatalf("unexpected replay/live payloads: %q … %q", data[0], data[10])
+	}
+}
+
+func TestLogsHandler_StreamLogs_LastEventIDHeader(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig, nil)
+	hub := handler.GetHub()
+	for range 5 {
+		hub.Write("line")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodGet, "/logs/stream", http.NoBody).WithContext(ctx)
+	req.Header.Set("Last-Event-Id", (logstream.Cursor{Epoch: hub.Epoch(), Seq: 4}).String())
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop within timeout")
+	}
+
+	var seqs []uint64
+	for _, frame := range parseSSEFrames(rec.Body.String()) {
+		cursor, _ := logstream.ParseCursor(frame.id)
+		seqs = append(seqs, cursor.Seq)
+	}
+	if len(seqs) != 1 || seqs[0] != 5 {
+		t.Fatalf("expected only seq 5 replayed, got %v", seqs)
+	}
+}
+
+func TestLogsHandler_StreamLogs_ResetOnForeignEpoch(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig, nil)
+	hub := handler.GetHub()
+	hub.Write("after restart 1")
+	hub.Write("after restart 2")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodGet, "/logs/stream?after=0123456789abcdef-50", http.NoBody).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop within timeout")
+	}
+
+	body := rec.Body.String()
+	resetIdx := strings.Index(body, "event: reset")
+	if resetIdx < 0 {
+		t.Fatal("expected reset event")
+	}
+	if !strings.Contains(body, `"reason":"restart"`) {
+		t.Fatalf("expected restart reason, got %s", body)
+	}
+	firstDataIdx := strings.Index(body, "data: after restart 1")
+	if firstDataIdx < 0 || resetIdx > firstDataIdx {
+		t.Fatal("reset event must precede the fresh history snapshot")
+	}
+}
+
+func TestLogsHandler_StreamLogs_ResetOnExpiredCursor(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig, nil)
+	hub := handler.GetHub()
+	// Fill a 1000-capacity ring past its history so an early cursor expires.
+	for i := range logstream.DefaultBufferSize + 50 {
+		hub.Write("line " + strconv.Itoa(i))
+	}
+
+	after := (logstream.Cursor{Epoch: hub.Epoch(), Seq: 5}).String()
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodGet, "/logs/stream?limit=10&after="+after, http.NoBody).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop within timeout")
+	}
+
+	if !strings.Contains(rec.Body.String(), `"reason":"cursor_expired"`) {
+		t.Fatalf("expected cursor_expired reset, got %s", rec.Body.String())
+	}
+}
+
+func TestLogsHandler_StreamLogs_ResetOnInvalidCursor(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig, nil)
+	handler.GetHub().Write("line")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodGet, "/logs/stream?after=not-a-cursor", http.NoBody).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop within timeout")
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: reset") || !strings.Contains(body, `"reason":"invalid_cursor"`) {
+		t.Fatalf("expected invalid_cursor reset, got %s", body)
+	}
+}
+
+// blockingRecorder blocks every Write until release is closed, so a burst of
+// log lines can overflow the subscriber channel before the handler drains it.
+type blockingRecorder struct {
+	*httptest.ResponseRecorder
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingRecorder) Write(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return b.ResponseRecorder.Write(p)
+}
+
+func TestLogsHandler_StreamLogs_GapOnOverflow(t *testing.T) {
+	appConfig := createTestConfig(t)
+	handler := NewLogsHandler(appConfig, nil)
+	hub := handler.GetHub()
+
+	rec := &blockingRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		started:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/logs/stream?limit=10", http.NoBody)
+	done := make(chan struct{})
+	go func() {
+		handler.StreamLogs(rec, req)
+		close(done)
+	}()
+
+	// Wait until the handler's first frame write is parked, then overflow the
+	// 100-entry subscriber buffer while it cannot make progress.
+	<-rec.started
+	for range logstream.DefaultSubscriberBuffer + 50 {
+		hub.Write("burst line")
+	}
+	close(rec.release)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not stop after gap")
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: gap") || !strings.Contains(body, `"reason":"buffer_overflow"`) {
+		t.Fatalf("expected observable gap event, got %s", body)
 	}
 }
 

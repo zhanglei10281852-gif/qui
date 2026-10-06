@@ -391,7 +391,14 @@
       "maxLive": "max",
       "maxPaused": "max en pause",
       "oldestEntriesDropped": "• anciennes entrées ignorées",
-      "muteSimilarEntries": "Masquer les entrées similaires"
+      "muteSimilarEntries": "Masquer les entrées similaires",
+      "reconnecting": "Connexion perdue. Reconnexion…",
+      "streamGap": "Flux de journaux en retard ; reconnexion pour reprendre à la dernière position…",
+      "streamReset": "Flux de journaux réinitialisé ({{reason}}) ; les journaux récents ont été rechargés et les entrées plus anciennes peuvent être indisponibles.",
+      "reasonRestart": "serveur redémarré",
+      "reasonCursorExpired": "la dernière position est trop ancienne",
+      "reasonCursorAhead": "la dernière position est en avance sur le serveur",
+      "reasonInvalidCursor": "la dernière position n'a pas été reconnue"
     },
     "entryDialog": {
       "title": "Entrée de log",

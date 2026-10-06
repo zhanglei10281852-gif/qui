@@ -389,7 +389,14 @@
       "maxLive": "实时最大值",
       "maxPaused": "暂停时最大值",
       "oldestEntriesDropped": "· 最早的条目已丢弃",
-      "muteSimilarEntries": "静音类似条目"
+      "muteSimilarEntries": "静音类似条目",
+      "reconnecting": "连接中断，正在重新连接…",
+      "streamGap": "日志流落后，正在重新连接以从最后位置继续…",
+      "streamReset": "日志流已重置（{{reason}}）；已重新加载最近日志，更早的条目可能无法获取。",
+      "reasonRestart": "服务器已重启",
+      "reasonCursorExpired": "最后位置过旧",
+      "reasonCursorAhead": "最后位置超前于服务器",
+      "reasonInvalidCursor": "无法识别最后的位置"
     },
     "entryDialog": {
       "title": "日志条目",

@@ -389,7 +389,14 @@
       "maxLive": "최대",
       "maxPaused": "일시 정지 중 최대",
       "oldestEntriesDropped": "• 가장 오래된 항목이 삭제됨",
-      "muteSimilarEntries": "유사한 항목 음소거"
+      "muteSimilarEntries": "유사한 항목 음소거",
+      "reconnecting": "연결이 끊겼습니다. 재연결 중…",
+      "streamGap": "로그 스트림이 뒤처졌습니다. 마지막 위치부터 이어받기 위해 재연결 중…",
+      "streamReset": "로그 스트림이 재설정되었습니다({{reason}}). 최근 로그를 다시 불러왔으며 이전 항목은 사용하지 못할 수 있습니다.",
+      "reasonRestart": "서버 재시작됨",
+      "reasonCursorExpired": "마지막 위치가 너무 오래됨",
+      "reasonCursorAhead": "마지막 위치가 서버보다 앞서 있음",
+      "reasonInvalidCursor": "마지막 위치를 인식할 수 없음"
     },
     "entryDialog": {
       "title": "로그 항목",

@@ -391,7 +391,14 @@
       "maxLive": "máx",
       "maxPaused": "máx enquanto pausado",
       "oldestEntriesDropped": "• entradas mais antigas descartadas",
-      "muteSimilarEntries": "Silenciar entradas semelhantes"
+      "muteSimilarEntries": "Silenciar entradas semelhantes",
+      "reconnecting": "Conexão perdida. Reconectando…",
+      "streamGap": "Fluxo de logs atrasado; reconectando para retomar da última posição…",
+      "streamReset": "Fluxo de logs redefinido ({{reason}}); os logs recentes foram recarregados e as entradas mais antigas podem estar indisponíveis.",
+      "reasonRestart": "servidor reiniciado",
+      "reasonCursorExpired": "a última posição é muito antiga",
+      "reasonCursorAhead": "a última posição está à frente do servidor",
+      "reasonInvalidCursor": "a última posição não foi reconhecida"
     },
     "entryDialog": {
       "title": "Entrada de Log",

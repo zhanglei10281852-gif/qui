@@ -393,7 +393,14 @@
       "maxLive": "max",
       "maxPaused": "max při pozastavení",
       "oldestEntriesDropped": "• nejstarší záznamy odstraněny",
-      "muteSimilarEntries": "Ztlumit podobné záznamy"
+      "muteSimilarEntries": "Ztlumit podobné záznamy",
+      "reconnecting": "Spojení ztraceno. Znovu se připojuje…",
+      "streamGap": "Protokol zaostává; znovu se připojuje, aby pokračoval od poslední pozice…",
+      "streamReset": "Protokol byl resetován ({{reason}}); nedávné záznamy byly znovu načteny, starší nemusí být dostupné.",
+      "reasonRestart": "server byl restartován",
+      "reasonCursorExpired": "poslední pozice je příliš stará",
+      "reasonCursorAhead": "poslední pozice je před serverem",
+      "reasonInvalidCursor": "poslední pozice nebyla rozpoznána"
     },
     "entryDialog": {
       "title": "Log záznam",

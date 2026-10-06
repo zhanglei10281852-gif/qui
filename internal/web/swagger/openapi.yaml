@@ -5469,7 +5469,28 @@ paths:
       tags:
         - System
       summary: Stream live logs
-      description: Server-Sent Events endpoint for streaming live log lines. Sends initial history (configurable via limit parameter) then streams new log lines in real-time.
+      description: >-
+        Server-Sent Events endpoint for streaming log lines. Sends initial
+        history (configurable via the limit parameter), then streams new log
+        lines in real time.
+
+
+        Every log line is framed with an SSE id field carrying an opaque
+        cursor in the form "<epoch>-<sequence>". The epoch identifies the
+        in-memory log hub and changes when the server restarts; the sequence
+        is monotonically increasing within an epoch. On reconnect the client
+        resumes from its last cursor: browsers resend it automatically in the
+        Last-Event-ID header, and the after query parameter accepts the same
+        value for explicit reconnects. The history-to-live handoff is atomic,
+        so no line is replayed twice or skipped.
+
+
+        Named control events are sent without an id: "reset" precedes a fresh
+        history snapshot when the cursor cannot be honoured (reason restart,
+        cursor_expired, cursor_ahead, or invalid_cursor); the client must
+        discard its previous lines. "gap" (reason buffer_overflow) ends the
+        stream when a slow subscriber fell behind; the client reconnects from
+        its last cursor to recover. A "retry" field sets the reconnect delay.
       parameters:
         - name: limit
           in: query
@@ -5477,6 +5498,11 @@ paths:
           schema:
             type: integer
             default: 1000
+        - name: after
+          in: query
+          description: Cursor ("<epoch>-<sequence>") of the last received log line for explicit reconnects; the Last-Event-ID header takes precedence
+          schema:
+            type: string
       responses:
         '200':
           description: SSE stream of log lines
@@ -5484,7 +5510,7 @@ paths:
             text/event-stream:
               schema:
                 type: string
-                description: Each message is a log line in SSE format
+                description: Each log line is an SSE message with an id cursor and the raw line in data; reset/gap are named events with a JSON reason payload
 
   /api/logs/files:
     get:

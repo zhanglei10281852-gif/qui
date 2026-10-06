@@ -391,7 +391,14 @@
       "maxLive": "màx.",
       "maxPaused": "màx. en pausa",
       "oldestEntriesDropped": "• s'han descartat les entrades més antigues",
-      "muteSimilarEntries": "Silencia les entrades semblants"
+      "muteSimilarEntries": "Silencia les entrades semblants",
+      "reconnecting": "S'ha perdut la connexió. Tornant a connectar…",
+      "streamGap": "El flux de registres s'ha endarrerit; tornant a connectar per reprendre des de l'última posició…",
+      "streamReset": "S'ha reinicialitzat el flux de registres ({{reason}}); s'han tornat a carregar els registres recents i les entrades més antigues poden no estar disponibles.",
+      "reasonRestart": "servidor reiniciat",
+      "reasonCursorExpired": "l'última posició és massa antiga",
+      "reasonCursorAhead": "l'última posició està per davant del servidor",
+      "reasonInvalidCursor": "l'última posició no s'ha reconegut"
     },
     "entryDialog": {
       "title": "Entrada de registre",

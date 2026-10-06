@@ -391,7 +391,14 @@
       "maxLive": "max.",
       "maxPaused": "max. bei Pause",
       "oldestEntriesDropped": "• älteste Einträge verworfen",
-      "muteSimilarEntries": "Ähnliche Einträge stummschalten"
+      "muteSimilarEntries": "Ähnliche Einträge stummschalten",
+      "reconnecting": "Verbindung verloren. Erneute Verbindung…",
+      "streamGap": "Protokollstrom hinkt hinterher; es wird erneut verbunden, um an der letzten Position fortzufahren…",
+      "streamReset": "Protokollstrom zurückgesetzt ({{reason}}); die letzten Protokolle wurden neu geladen, ältere Einträge sind möglicherweise nicht verfügbar.",
+      "reasonRestart": "Server neu gestartet",
+      "reasonCursorExpired": "letzte Position ist zu alt",
+      "reasonCursorAhead": "letzte Position liegt vor dem Server",
+      "reasonInvalidCursor": "letzte Position wurde nicht erkannt"
     },
     "entryDialog": {
       "title": "Protokolleintrag",

@@ -221,7 +221,19 @@ func (h *LogsHandler) UpdateLogSettings(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// sseRetryDelay tells EventSource how long to wait (ms) before reconnecting.
+const sseRetryDelay = 3000
+
 // StreamLogs streams log lines via SSE.
+//
+// Every log line is framed with its cursor ("id: epoch-seq") so a reconnecting
+// client resumes exactly where it stopped: the browser resends it as
+// Last-Event-ID on automatic reconnects, and the "after" query parameter
+// covers explicit reconnects. The replay-to-live handoff is atomic in the hub,
+// so lines are neither duplicated nor skipped. When a cursor cannot be
+// honoured a "reset" event precedes a fresh history snapshot; when a live
+// subscriber falls behind a "gap" event ends the stream and the client
+// reconnects to recover.
 func (h *LogsHandler) StreamLogs(w http.ResponseWriter, r *http.Request) {
 	limit := h.parseLimit(r)
 
@@ -231,14 +243,53 @@ func (h *LogsHandler) StreamLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sub := hub.Subscribe(r.Context())
+	after, invalidCursor := cursorFromRequest(r)
+
+	// Open registers the subscriber and snapshots replay under one lock, so
+	// the live channel starts at the sequence right after replay.
+	sub, replay, reset := hub.Open(r.Context(), after, limit)
 	defer hub.Unsubscribe(sub)
 
-	if err := h.sendHistory(w, flusher, hub, limit); err != nil {
-		return
+	if invalidCursor {
+		reset = logstream.ResetReason(reasonInvalidCursor)
 	}
 
-	h.streamLoop(r.Context(), w, flusher, sub)
+	if err := writeSSERetry(w); err != nil {
+		return
+	}
+	if reset != "" {
+		if err := writeSSESignal(w, eventReset, streamSignal{Reason: string(reset)}); err != nil {
+			return
+		}
+	}
+	epoch := hub.Epoch()
+	for _, entry := range replay {
+		if err := writeSSEEntry(w, (logstream.Cursor{Epoch: epoch, Seq: entry.Seq}).String(), entry.Line); err != nil {
+			return
+		}
+	}
+	flusher.Flush()
+
+	h.streamLoop(r.Context(), w, flusher, sub, epoch)
+}
+
+// cursorFromRequest extracts the resume cursor from the Last-Event-ID header
+// (automatic EventSource reconnects) or the "after" query parameter
+// (explicit reconnects). A malformed cursor is reported separately so the
+// stream can reset with fresh history instead of failing.
+func cursorFromRequest(r *http.Request) (*logstream.Cursor, bool) {
+	raw := r.Header.Get("Last-Event-Id")
+	if raw == "" {
+		raw = r.URL.Query().Get("after")
+	}
+	if raw == "" {
+		return nil, false
+	}
+	cursor, ok := logstream.ParseCursor(raw)
+	if !ok {
+		return nil, true
+	}
+	return &cursor, false
 }
 
 func (h *LogsHandler) parseLimit(r *http.Request) int {
@@ -255,6 +306,19 @@ var (
 	errStreamingNotSupported = errors.New("streaming not supported")
 	errLogStreamNotAvailable = errors.New("log streaming not available")
 )
+
+// SSE control event names and reset reasons, matched by the frontend.
+const (
+	eventReset         = "reset"
+	eventGap           = "gap"
+	reasonInvalidCursor = "invalid_cursor"
+	reasonBufferGap     = "buffer_overflow"
+)
+
+// streamSignal is the JSON payload of a reset/gap control event.
+type streamSignal struct {
+	Reason string `json:"reason"`
+}
 
 func (h *LogsHandler) prepareSSE(w http.ResponseWriter) (http.Flusher, *logstream.Hub, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -275,23 +339,31 @@ func (h *LogsHandler) prepareSSE(w http.ResponseWriter) (http.Flusher, *logstrea
 	return flusher, hub, nil
 }
 
-func (h *LogsHandler) sendHistory(w http.ResponseWriter, flusher http.Flusher, hub *logstream.Hub, limit int) error {
-	history := hub.History(limit)
-	for _, line := range history {
-		if err := writeSSEData(w, line); err != nil {
-			return err
-		}
+func writeSSERetry(w http.ResponseWriter) error {
+	_, err := fmt.Fprintf(w, "retry: %d\n\n", sseRetryDelay)
+	return err //nolint:wrapcheck // SSE write errors are terminal; wrapping adds no value
+}
+
+// writeSSEEntry frames one log line with its cursor. The data payload stays
+// the raw log line exactly as before ("data: <line>"); the id field carries
+// the cursor and is delivered as event.lastEventId.
+func writeSSEEntry(w http.ResponseWriter, id, data string) error {
+	_, err := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", id, data) //nolint:gosec // G705: an SSE stream is text/event-stream, never rendered as HTML
+	return err                                                //nolint:wrapcheck // SSE write errors are terminal; wrapping adds no value
+}
+
+// writeSSESignal sends a named control event (reset/gap) with a JSON payload.
+// It deliberately carries no id field so it does not move the resume cursor.
+func writeSSESignal(w http.ResponseWriter, event string, payload streamSignal) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal SSE %s event: %w", event, err)
 	}
-	flusher.Flush()
-	return nil
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, body) //nolint:gosec // G705: an SSE stream is text/event-stream, never rendered as HTML
+	return err                                                     //nolint:wrapcheck // SSE write errors are terminal; wrapping adds no value
 }
 
-func writeSSEData(w http.ResponseWriter, data string) error {
-	_, err := fmt.Fprintf(w, "data: %s\n\n", data) //nolint:gosec // G705: an SSE stream is text/event-stream, never rendered as HTML
-	return err                                     //nolint:wrapcheck // SSE write errors are terminal; wrapping adds no value
-}
-
-func (h *LogsHandler) streamLoop(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sub *logstream.Subscriber) {
+func (h *LogsHandler) streamLoop(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sub *logstream.Subscriber, epoch string) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -301,11 +373,20 @@ func (h *LogsHandler) streamLoop(ctx context.Context, w http.ResponseWriter, flu
 			return
 		case <-h.shutdown:
 			return
-		case line, ok := <-sub.Channel():
+		case <-sub.Gap():
+			// Entries were dropped for this slow consumer; the stream is no
+			// longer contiguous. Signal the client and end so it reconnects
+			// from its last cursor and replays what the ring still holds.
+			if err := writeSSESignal(w, eventGap, streamSignal{Reason: reasonBufferGap}); err != nil {
+				return
+			}
+			flusher.Flush()
+			return
+		case entry, ok := <-sub.Channel():
 			if !ok {
 				return
 			}
-			if err := writeSSEData(w, line); err != nil {
+			if err := writeSSEEntry(w, (logstream.Cursor{Epoch: epoch, Seq: entry.Seq}).String(), entry.Line); err != nil {
 				return
 			}
 			flusher.Flush()
