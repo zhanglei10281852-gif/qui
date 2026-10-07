@@ -5676,6 +5676,39 @@ paths:
         '500':
           description: Failed to import manifest
 
+  /api/instances/{instanceID}/backups/runs/{runId}/retry:
+    post:
+      tags:
+        - Backups
+      summary: Retry missing torrent recovery for an import run
+      description: >-
+        Resumes background recovery of torrent files that could not be fetched
+        from qBittorrent when the manifest was imported. Only items that are
+        still missing are processed; already recovered items are never touched
+        or duplicated. The run settles to "success" when every blob is
+        available or "failed" with an error summary otherwise.
+      parameters:
+        - $ref: '#/components/parameters/instanceID'
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Import backup run ID
+      responses:
+        '202':
+          description: Retry accepted; recovery is running or finished
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupRun'
+        '404':
+          description: Backup run not found
+        '409':
+          description: Run is not a manifest import, or torrent recovery is already running
+        '500':
+          description: Failed to retry import recovery
+
   /api/instances/{instanceID}/backups/runs/{runId}/restore/preview:
     post:
       tags:
@@ -9238,7 +9271,7 @@ components:
           type: integer
         kind:
           type: string
-          enum: ["manual", "hourly", "daily", "weekly", "monthly"]
+          enum: ["manual", "hourly", "daily", "weekly", "monthly", "import"]
         status:
           type: string
           enum: ["pending", "running", "success", "failed", "canceled"]

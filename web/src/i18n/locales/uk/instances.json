@@ -1854,6 +1854,7 @@
         "restoreFromBackup": "Відновити торенти з цієї резервної копії",
         "downloadBackup": "Завантажте резервну копію архіву",
         "downloadUnavailable": "Завантаження недоступне",
+        "retryImport": "Повторити отримання відсутніх файлів торентів",
         "deleteBackup": "Видалити цю резервну копію"
       },
       "downloadFormats": {
@@ -1901,7 +1902,14 @@
       "backupDeleted": "Резервний запуск видалено",
       "failedToDeleteBackup": "Не вдалося видалити резервне копіювання",
       "allBackupsDeleted": "Видалено усі резервні копії",
-      "failedToDeleteBackups": "Не вдалося видалити резервні копії"
+      "failedToDeleteBackups": "Не вдалося видалити резервні копії",
+      "importRetryStarted": "Відновлення відсутніх файлів торентів…",
+      "failedToRetryImport": "Не вдалося повторити отримання торентів"
+    },
+    "blobStatus": {
+      "available": "Отримано",
+      "pending": "Отримання…",
+      "failed": "Відсутній"
     },
     "statusLabels": {
       "pending": "Очікує",

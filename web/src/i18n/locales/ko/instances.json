@@ -1771,6 +1771,7 @@
         "restoreFromBackup": "이 백업에서 토렌트 복원",
         "downloadBackup": "백업 아카이브 다운로드",
         "downloadUnavailable": "다운로드 사용 불가",
+        "retryImport": "누락된 토렌트 파일 다시 가져오기",
         "deleteBackup": "이 백업 삭제"
       },
       "downloadFormats": {
@@ -1818,7 +1819,14 @@
       "backupDeleted": "백업 실행이 삭제되었습니다",
       "failedToDeleteBackup": "백업 실행을 삭제하지 못했습니다",
       "allBackupsDeleted": "모든 백업을 삭제했습니다",
-      "failedToDeleteBackups": "백업을 삭제하지 못했습니다"
+      "failedToDeleteBackups": "백업을 삭제하지 못했습니다",
+      "importRetryStarted": "누락된 토렌트 파일을 가져오는 중…",
+      "failedToRetryImport": "토렌트 가져오기 재시도에 실패했습니다"
+    },
+    "blobStatus": {
+      "available": "가져옴",
+      "pending": "가져오는 중…",
+      "failed": "누락됨"
     }
   }
 }

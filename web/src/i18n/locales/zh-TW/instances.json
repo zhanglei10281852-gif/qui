@@ -1771,6 +1771,7 @@
         "restoreFromBackup": "從此備份還原種子",
         "downloadBackup": "下載備份封存",
         "downloadUnavailable": "下載不可用",
+        "retryImport": "重試取得缺失的種子檔案",
         "deleteBackup": "刪除此備份"
       },
       "downloadFormats": {
@@ -1818,7 +1819,14 @@
       "backupDeleted": "備份已刪除",
       "failedToDeleteBackup": "刪除備份失敗",
       "allBackupsDeleted": "所有備份已刪除",
-      "failedToDeleteBackups": "刪除備份失敗"
+      "failedToDeleteBackups": "刪除備份失敗",
+      "importRetryStarted": "正在補取缺失的種子檔案……",
+      "failedToRetryImport": "重試種子補取失敗"
+    },
+    "blobStatus": {
+      "available": "已補取",
+      "pending": "補取中……",
+      "failed": "缺失"
     }
   }
 }

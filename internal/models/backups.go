@@ -74,6 +74,21 @@ const (
 	BackupRunKindDaily   BackupRunKind = "daily"
 	BackupRunKindWeekly  BackupRunKind = "weekly"
 	BackupRunKindMonthly BackupRunKind = "monthly"
+	BackupRunKindImport  BackupRunKind = "import"
+)
+
+// BackupItemBlobStatus tracks recovery of an imported item's torrent blob.
+type BackupItemBlobStatus string
+
+const (
+	// BackupBlobAvailable means the blob is present and usable: shipped in
+	// the archive, already present in the cache, or recovered successfully.
+	BackupBlobAvailable BackupItemBlobStatus = "available"
+	// BackupBlobPending means the blob was missing and recovery has not yet
+	// finished (or has not run, e.g. right after import or a restart).
+	BackupBlobPending BackupItemBlobStatus = "pending"
+	// BackupBlobFailed means recovery ran but could not obtain the blob.
+	BackupBlobFailed BackupItemBlobStatus = "failed"
 )
 
 type BackupRun struct {
@@ -98,19 +113,21 @@ type BackupRun struct {
 }
 
 type BackupItem struct {
-	ID              int64     `json:"id"`
-	RunID           int64     `json:"runId"`
-	TorrentHash     string    `json:"torrentHash"`
-	Name            string    `json:"name"`
-	Category        *string   `json:"category,omitempty"`
-	SizeBytes       int64     `json:"sizeBytes"`
-	ArchiveRelPath  *string   `json:"archiveRelPath,omitempty"`
-	InfoHashV1      *string   `json:"infohashV1,omitempty"`
-	InfoHashV2      *string   `json:"infohashV2,omitempty"`
-	Tags            *string   `json:"tags,omitempty"`
-	TorrentBlobPath *string   `json:"torrentBlobPath,omitempty"`
-	SavePath        *string   `json:"savePath,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
+	ID              int64                `json:"id"`
+	RunID           int64                `json:"runId"`
+	TorrentHash     string               `json:"torrentHash"`
+	Name            string               `json:"name"`
+	Category        *string              `json:"category,omitempty"`
+	SizeBytes       int64                `json:"sizeBytes"`
+	ArchiveRelPath  *string              `json:"archiveRelPath,omitempty"`
+	InfoHashV1      *string              `json:"infohashV1,omitempty"`
+	InfoHashV2      *string              `json:"infohashV2,omitempty"`
+	Tags            *string              `json:"tags,omitempty"`
+	TorrentBlobPath *string              `json:"torrentBlobPath,omitempty"`
+	BlobStatus      BackupItemBlobStatus `json:"blobStatus"`
+	BlobError       *string              `json:"blobError,omitempty"`
+	SavePath        *string              `json:"savePath,omitempty"`
+	CreatedAt       time.Time            `json:"createdAt"`
 }
 
 type CategorySnapshot struct {
@@ -849,16 +866,18 @@ func (s *BackupStore) InsertItems(ctx context.Context, runID int64, items []Back
 
 	// Batch insert items with larger chunks for better performance
 	// SQLite SQLITE_MAX_VARIABLE_NUMBER is typically 32766 on modern systems
-	// but default is 999. Use 90 items * 11 params = 990 to stay safe
-	const chunkSize = 90
-	const paramsPerItem = 11
+	// but default is 999. Use 76 items * 13 params = 988 to stay safe
+	const chunkSize = 76
+	const paramsPerItem = 13
 
 	// Pre-build the query template for full chunks to avoid repeated string building in hot path.
-	// save_path is a plain TEXT column (not interned): cross-seed paths are unique
-	// per torrent and would only bloat string_pool, so it is written verbatim.
+	// save_path and the import recovery columns (blob_status, blob_error) are
+	// plain TEXT (not interned): their values are unique per item and would
+	// only bloat string_pool, so they are written verbatim.
 	queryTemplate := `INSERT INTO instance_backup_items (
 		run_id, torrent_hash_id, name_id, category_id, size_bytes,
-		archive_rel_path_id, infohash_v1_id, infohash_v2_id, tags_id, torrent_blob_path_id, save_path
+		archive_rel_path_id, infohash_v1_id, infohash_v2_id, tags_id, torrent_blob_path_id,
+		blob_status, blob_error, save_path
 	) VALUES %s`
 	fullQuery := dbinterface.BuildQueryWithPlaceholders(queryTemplate, paramsPerItem, chunkSize)
 
@@ -878,6 +897,11 @@ func (s *BackupStore) InsertItems(ctx context.Context, runID int64, items []Back
 			torrentHashID := stringToID[item.TorrentHash]
 			nameID := stringToID[item.Name]
 
+			blobStatus := item.BlobStatus
+			if blobStatus == "" {
+				blobStatus = BackupBlobAvailable
+			}
+
 			args = append(args,
 				runID,
 				torrentHashID,
@@ -889,6 +913,8 @@ func (s *BackupStore) InsertItems(ctx context.Context, runID int64, items []Back
 				getID(item.InfoHashV2),
 				getID(item.Tags),
 				getID(item.TorrentBlobPath),
+				string(blobStatus),
+				item.BlobError,
 				item.SavePath,
 			)
 		}
@@ -909,7 +935,7 @@ func (s *BackupStore) ListItems(ctx context.Context, runID int64) ([]*BackupItem
 	}
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, run_id, torrent_hash, name, category, size_bytes, archive_rel_path, infohash_v1, infohash_v2, tags, torrent_blob_path, save_path, created_at
+		SELECT id, run_id, torrent_hash, name, category, size_bytes, archive_rel_path, infohash_v1, infohash_v2, tags, torrent_blob_path, blob_status, blob_error, save_path, created_at
 		FROM instance_backup_items_view
 		WHERE run_id = ?
 		ORDER BY %s
@@ -929,6 +955,7 @@ func (s *BackupStore) ListItems(ctx context.Context, runID int64) ([]*BackupItem
 		var infohashV2 sql.NullString
 		var tags sql.NullString
 		var blobPath sql.NullString
+		var blobErr sql.NullString
 		var savePath sql.NullString
 		if err := rows.Scan(
 			&item.ID,
@@ -942,6 +969,8 @@ func (s *BackupStore) ListItems(ctx context.Context, runID int64) ([]*BackupItem
 			&infohashV2,
 			&tags,
 			&blobPath,
+			&item.BlobStatus,
+			&blobErr,
 			&savePath,
 			&item.CreatedAt,
 		); err != nil {
@@ -964,6 +993,9 @@ func (s *BackupStore) ListItems(ctx context.Context, runID int64) ([]*BackupItem
 		}
 		if blobPath.Valid {
 			item.TorrentBlobPath = &blobPath.String
+		}
+		if blobErr.Valid && blobErr.String != "" {
+			item.BlobError = &blobErr.String
 		}
 		if savePath.Valid {
 			item.SavePath = &savePath.String
@@ -1014,7 +1046,7 @@ func (s *BackupStore) listItemsForRunsChunk(ctx context.Context, runIDs []int64)
 	}
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, run_id, torrent_hash, name, category, size_bytes, archive_rel_path, infohash_v1, infohash_v2, tags, torrent_blob_path, save_path, created_at
+		SELECT id, run_id, torrent_hash, name, category, size_bytes, archive_rel_path, infohash_v1, infohash_v2, tags, torrent_blob_path, blob_status, blob_error, save_path, created_at
 		FROM instance_backup_items_view
 		WHERE run_id IN `+buildInPlaceholders(len(runIDs))+`
 		ORDER BY run_id, %s
@@ -1034,6 +1066,7 @@ func (s *BackupStore) listItemsForRunsChunk(ctx context.Context, runIDs []int64)
 		var infohashV2 sql.NullString
 		var tags sql.NullString
 		var blobPath sql.NullString
+		var blobErr sql.NullString
 		var savePath sql.NullString
 		if err := rows.Scan(
 			&item.ID,
@@ -1047,6 +1080,8 @@ func (s *BackupStore) listItemsForRunsChunk(ctx context.Context, runIDs []int64)
 			&infohashV2,
 			&tags,
 			&blobPath,
+			&item.BlobStatus,
+			&blobErr,
 			&savePath,
 			&item.CreatedAt,
 		); err != nil {
@@ -1070,6 +1105,9 @@ func (s *BackupStore) listItemsForRunsChunk(ctx context.Context, runIDs []int64)
 		if blobPath.Valid {
 			item.TorrentBlobPath = &blobPath.String
 		}
+		if blobErr.Valid && blobErr.String != "" {
+			item.BlobError = &blobErr.String
+		}
 		if savePath.Valid {
 			item.SavePath = &savePath.String
 		}
@@ -1085,7 +1123,7 @@ func (s *BackupStore) listItemsForRunsChunk(ctx context.Context, runIDs []int64)
 
 func (s *BackupStore) GetItemByHash(ctx context.Context, runID int64, hash string) (*BackupItem, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, run_id, torrent_hash, name, category, size_bytes, archive_rel_path, infohash_v1, infohash_v2, tags, torrent_blob_path, save_path, created_at
+		SELECT id, run_id, torrent_hash, name, category, size_bytes, archive_rel_path, infohash_v1, infohash_v2, tags, torrent_blob_path, blob_status, blob_error, save_path, created_at
 		FROM instance_backup_items_view
 		WHERE run_id = ? AND torrent_hash = ?
 		LIMIT 1
@@ -1098,6 +1136,7 @@ func (s *BackupStore) GetItemByHash(ctx context.Context, runID int64, hash strin
 	var infohashV2 sql.NullString
 	var tags sql.NullString
 	var blobPath sql.NullString
+	var blobErr sql.NullString
 	var savePath sql.NullString
 
 	if err := row.Scan(
@@ -1112,6 +1151,8 @@ func (s *BackupStore) GetItemByHash(ctx context.Context, runID int64, hash strin
 		&infohashV2,
 		&tags,
 		&blobPath,
+		&item.BlobStatus,
+		&blobErr,
 		&savePath,
 		&item.CreatedAt,
 	); err != nil {
@@ -1135,6 +1176,9 @@ func (s *BackupStore) GetItemByHash(ctx context.Context, runID int64, hash strin
 	}
 	if blobPath.Valid {
 		item.TorrentBlobPath = &blobPath.String
+	}
+	if blobErr.Valid && blobErr.String != "" {
+		item.BlobError = &blobErr.String
 	}
 	if savePath.Valid {
 		item.SavePath = &savePath.String
@@ -1799,6 +1843,198 @@ func (s *BackupStore) cleanupRunsChunk(ctx context.Context, runIDs []int64) erro
 	}
 
 	return nil
+}
+
+// CountItems returns how many manifest item rows a run owns.
+func (s *BackupStore) CountItems(ctx context.Context, runID int64) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM instance_backup_items WHERE run_id = ?", runID,
+	).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ListItemsForBlobRecovery returns a run's items that still need blob
+// recovery: rows that reference a torrent blob and whose blob_status is one
+// of the supplied statuses. The DB is the source of truth for what a retry
+// or a post-restart resume may work on, so completed items are never touched.
+func (s *BackupStore) ListItemsForBlobRecovery(ctx context.Context, runID int64, statuses []BackupItemBlobStatus) ([]*BackupItem, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+
+	placeholders := buildInPlaceholders(len(statuses))
+	args := make([]any, 0, len(statuses)+1)
+	args = append(args, runID)
+	for _, status := range statuses {
+		args = append(args, string(status))
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, torrent_hash, name, category, size_bytes, archive_rel_path, infohash_v1, infohash_v2, tags, torrent_blob_path, blob_status, blob_error, save_path, created_at
+		FROM instance_backup_items_view
+		WHERE run_id = ?
+		  AND torrent_blob_path IS NOT NULL
+		  AND blob_status IN `+placeholders+`
+		ORDER BY id
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]*BackupItem, 0)
+	for rows.Next() {
+		var item BackupItem
+		var category sql.NullString
+		var relPath sql.NullString
+		var infohashV1 sql.NullString
+		var infohashV2 sql.NullString
+		var tags sql.NullString
+		var blobPath sql.NullString
+		var blobErr sql.NullString
+		var savePath sql.NullString
+		if err := rows.Scan(
+			&item.ID,
+			&item.RunID,
+			&item.TorrentHash,
+			&item.Name,
+			&category,
+			&item.SizeBytes,
+			&relPath,
+			&infohashV1,
+			&infohashV2,
+			&tags,
+			&blobPath,
+			&item.BlobStatus,
+			&blobErr,
+			&savePath,
+			&item.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if category.Valid {
+			item.Category = &category.String
+		}
+		if relPath.Valid {
+			item.ArchiveRelPath = &relPath.String
+		}
+		if infohashV1.Valid {
+			item.InfoHashV1 = &infohashV1.String
+		}
+		if infohashV2.Valid {
+			item.InfoHashV2 = &infohashV2.String
+		}
+		if tags.Valid {
+			item.Tags = &tags.String
+		}
+		if blobPath.Valid {
+			item.TorrentBlobPath = &blobPath.String
+		}
+		if blobErr.Valid && blobErr.String != "" {
+			item.BlobError = &blobErr.String
+		}
+		if savePath.Valid {
+			item.SavePath = &savePath.String
+		}
+		items = append(items, &item)
+	}
+
+	return items, rows.Err()
+}
+
+// BlobStatusCounts holds how many blob-referencing items of a run are in each
+// recovery state.
+type BlobStatusCounts struct {
+	Tracked   int
+	Available int
+	Pending   int
+	Failed    int
+}
+
+// CountItemsByBlobStatus counts blob-referencing items per recovery state.
+// Rows without a blob path are not tracked: nothing can be missing for them.
+func (s *BackupStore) CountItemsByBlobStatus(ctx context.Context, runID int64) (BlobStatusCounts, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT blob_status, COUNT(*)
+		FROM instance_backup_items
+		WHERE run_id = ? AND torrent_blob_path_id IS NOT NULL
+		GROUP BY blob_status
+	`, runID)
+	if err != nil {
+		return BlobStatusCounts{}, err
+	}
+	defer rows.Close()
+
+	var counts BlobStatusCounts
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return BlobStatusCounts{}, err
+		}
+		counts.Tracked += n
+		switch BackupItemBlobStatus(status) {
+		case BackupBlobAvailable:
+			counts.Available += n
+		case BackupBlobPending:
+			counts.Pending += n
+		case BackupBlobFailed:
+			counts.Failed += n
+		}
+	}
+	return counts, rows.Err()
+}
+
+// UpdateItemBlobState persists the recovery result for one item. A non-nil
+// blobPath repoints the row at an existing cached blob instead of writing a
+// duplicate file; nil leaves the stored path untouched.
+func (s *BackupStore) UpdateItemBlobState(ctx context.Context, itemID int64, status BackupItemBlobStatus, errorMessage *string, blobPath *string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if blobPath != nil {
+		ids, err := dbinterface.InternStringNullable(ctx, tx, blobPath)
+		if err != nil {
+			return fmt.Errorf("failed to intern blob path: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE instance_backup_items
+			SET blob_status = ?, blob_error = ?, torrent_blob_path_id = ?
+			WHERE id = ?
+		`, string(status), errorMessage, ids[0], itemID); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE instance_backup_items
+			SET blob_status = ?, blob_error = ?
+			WHERE id = ?
+		`, string(status), errorMessage, itemID); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ResetFailedBlobItems moves a run's failed blob items back to pending so a
+// retry processes them again. Returns the number of reset rows.
+func (s *BackupStore) ResetFailedBlobItems(ctx context.Context, runID int64) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE instance_backup_items
+		SET blob_status = ?, blob_error = NULL
+		WHERE run_id = ? AND blob_status = ? AND torrent_blob_path_id IS NOT NULL
+	`, string(BackupBlobPending), runID, string(BackupBlobFailed))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // FindIncompleteRuns returns all backup runs that are in pending or running status.

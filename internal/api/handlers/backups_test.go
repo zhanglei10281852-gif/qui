@@ -634,6 +634,96 @@ func TestSafeArchiveEntryPath(t *testing.T) {
 	}
 }
 
+func TestRetryImportRun_NonImportRun(t *testing.T) {
+	handler, db, _ := setupTestBackupHandler(t)
+
+	ctx := context.Background()
+	result, err := db.ExecContext(ctx, "INSERT INTO instances (name_id, host_id, username_id, password_encrypted) VALUES (1, 1, 1, 'pass')")
+	require.NoError(t, err)
+	instanceID64, err := result.LastInsertId()
+	require.NoError(t, err)
+	instanceID := int(instanceID64)
+
+	liveRun := &models.BackupRun{
+		InstanceID:  instanceID,
+		Kind:        models.BackupRunKindManual,
+		Status:      models.BackupRunStatusFailed,
+		RequestedBy: "test",
+	}
+	store := models.NewBackupStore(db)
+	require.NoError(t, store.CreateRun(ctx, liveRun))
+
+	req := newRequestWithParams(http.MethodPost, fmt.Sprintf("/api/instances/%d/backups/runs/%d/retry", instanceID, liveRun.ID), map[string]string{
+		"instanceID": strconv.Itoa(instanceID),
+		"runID":      strconv.FormatInt(liveRun.ID, 10),
+	})
+	w := httptest.NewRecorder()
+	handler.RetryImportRun(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+func TestRetryImportRun_NotFound(t *testing.T) {
+	handler, db, _ := setupTestBackupHandler(t)
+
+	ctx := context.Background()
+	result, err := db.ExecContext(ctx, "INSERT INTO instances (name_id, host_id, username_id, password_encrypted) VALUES (1, 1, 1, 'pass')")
+	require.NoError(t, err)
+	instanceID64, err := result.LastInsertId()
+	require.NoError(t, err)
+	instanceID := int(instanceID64)
+
+	req := newRequestWithParams(http.MethodPost, fmt.Sprintf("/api/instances/%d/backups/runs/999/retry", instanceID), map[string]string{
+		"instanceID": strconv.Itoa(instanceID),
+		"runID":      "999",
+	})
+	w := httptest.NewRecorder()
+	handler.RetryImportRun(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestRetryImportRun_FailedImportAccepted(t *testing.T) {
+	handler, db, _ := setupTestBackupHandler(t)
+
+	ctx := context.Background()
+	result, err := db.ExecContext(ctx, "INSERT INTO instances (name_id, host_id, username_id, password_encrypted) VALUES (1, 1, 1, 'pass')")
+	require.NoError(t, err)
+	instanceID64, err := result.LastInsertId()
+	require.NoError(t, err)
+	instanceID := int(instanceID64)
+
+	store := models.NewBackupStore(db)
+	importError := "1 of 1 torrent file(s) could not be recovered"
+	importRun := &models.BackupRun{
+		InstanceID:   instanceID,
+		Kind:         models.BackupRunKindImport,
+		Status:       models.BackupRunStatusFailed,
+		RequestedBy:  "test",
+		ErrorMessage: &importError,
+	}
+	require.NoError(t, store.CreateRun(ctx, importRun))
+	blobPath := "backups/torrents/ha/hashaa.torrent"
+	require.NoError(t, store.InsertItems(ctx, importRun.ID, []models.BackupItem{{
+		TorrentHash:     "hashaa",
+		Name:            "Torrent hashaa",
+		BlobStatus:      models.BackupBlobFailed,
+		TorrentBlobPath: &blobPath,
+	}}))
+
+	req := newRequestWithParams(http.MethodPost, fmt.Sprintf("/api/instances/%d/backups/runs/%d/retry", instanceID, importRun.ID), map[string]string{
+		"instanceID": strconv.Itoa(instanceID),
+		"runID":      strconv.FormatInt(importRun.ID, 10),
+	})
+	w := httptest.NewRecorder()
+	handler.RetryImportRun(w, req)
+
+	assert.Equal(t, http.StatusAccepted, w.Code)
+	var run models.BackupRun
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &run))
+	assert.Equal(t, models.BackupRunStatusRunning, run.Status)
+}
+
 // archiveEntry is one file to put in a test archive.
 type archiveEntry struct {
 	name string

@@ -1801,6 +1801,7 @@
         "restoreFromBackup": "Restore torrents from this backup",
         "downloadBackup": "Download backup archive",
         "downloadUnavailable": "Download unavailable",
+        "retryImport": "Retry missing torrent files",
         "deleteBackup": "Delete this backup"
       },
       "downloadFormats": {
@@ -1848,7 +1849,14 @@
       "backupDeleted": "Backup run deleted",
       "failedToDeleteBackup": "Failed to delete backup run",
       "allBackupsDeleted": "Deleted all backups",
-      "failedToDeleteBackups": "Failed to delete backups"
+      "failedToDeleteBackups": "Failed to delete backups",
+      "importRetryStarted": "Recovering missing torrent files…",
+      "failedToRetryImport": "Failed to retry torrent recovery"
+    },
+    "blobStatus": {
+      "available": "Recovered",
+      "pending": "Recovering…",
+      "failed": "Missing"
     }
   }
 }

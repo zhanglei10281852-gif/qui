@@ -745,6 +745,45 @@ func (h *BackupsHandler) ImportManifest(w http.ResponseWriter, r *http.Request) 
 	RespondJSON(w, http.StatusCreated, run)
 }
 
+// RetryImportRun resumes background recovery of missing torrent files for a
+// previously imported manifest. Only items that never got a blob are
+// processed; items already recovered are left untouched.
+func (h *BackupsHandler) RetryImportRun(w http.ResponseWriter, r *http.Request) {
+	instanceID, err := strconv.Atoi(chi.URLParam(r, "instanceID"))
+	if err != nil {
+		RespondError(w, http.StatusBadRequest, "Invalid instance ID")
+		return
+	}
+
+	runID, err := strconv.ParseInt(chi.URLParam(r, "runID"), 10, 64)
+	if err != nil {
+		RespondError(w, http.StatusBadRequest, "Invalid run ID")
+		return
+	}
+
+	run, err := h.service.RetryImportRun(r.Context(), runID)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			RespondError(w, http.StatusNotFound, "Backup run not found")
+		case errors.Is(err, backups.ErrImportRunNotRetryable):
+			RespondError(w, http.StatusConflict, "Run is not a manifest import")
+		case errors.Is(err, backups.ErrImportRecoveryActive):
+			RespondError(w, http.StatusConflict, "Torrent recovery is already running for this import")
+		default:
+			RespondError(w, http.StatusInternalServerError, "Failed to retry import")
+		}
+		return
+	}
+
+	if run.InstanceID != instanceID {
+		RespondError(w, http.StatusNotFound, "Backup run not found")
+		return
+	}
+
+	RespondJSON(w, http.StatusAccepted, run)
+}
+
 // archiveEntryBaseName classifies an archive entry by its final element.
 // Entry names are slash-delimited by the zip and tar specs, so filepath.Base
 // only agrees with that on Windows: on Linux it would read "b\\manifest.json"

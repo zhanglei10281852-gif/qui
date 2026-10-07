@@ -44,3 +44,7 @@ Every restore starts with a dry-run preview so you can inspect planned changes. 
 ## Importing backups
 
 If you need to migrate to a new server or recover after data loss, you can import a downloaded backup into any qui instance. Click **Import backup** on the Backups page and select the backup file. qui supports all export formats.
+
+When an archive does not include every `.torrent` file, qui fetches the missing files from the qBittorrent instance the backup belongs to in the background. The imported run stays **Running** until every file is available. A file already present in the cache is reused as-is, so a complete archive or a re-import never downloads anything twice.
+
+If qBittorrent cannot be reached or a file cannot be exported, the run ends as **Failed** and shows how many files are missing; the manifest view marks each missing file. Fix the connection, then use the retry action on the failed import run. Only the still-missing files are fetched—files already recovered are never rewritten. If qui restarts while recovery is in progress, the run resumes automatically from where it stopped; pending files continue, failed files stay reported until you retry.

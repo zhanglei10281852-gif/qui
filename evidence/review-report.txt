@@ -1,0 +1,13 @@
+题目：autobrr-qui-50687591-f595-4fe6-88f0-b991e10e539f
+项目：autobrr/qui
+Session：573311172224344:642132124ebfc9e1d552cfd045ecdbef_6ac515bb703ab42d9abb23b6.6ac515bc703ab42d9abb23b9.6ac515bc703ab42d9abb23b7:TraeCode CN.3.3.93.no_sid.no_ppe.T(2026/10/6 23:37:33)
+有效轮数：163（Trae；effectiveRoundsEvidence.source=count-trae-cn-steps.py；scope=latest_turn）
+
+Rubric ID：1｜状态：通过｜期望行为：全量清单且所有文件可用时，导入运行保持成功并复用已有缓存，现有下载与查询路径不回归。｜实际观察：完整归档测试在不调用 qBittorrent 的情况下创建 2 个 available 条目并将运行置为 success；缓存复用测试引用既有 blob，声明路径未创建重复文件；受影响 Go 包测试通过。｜直接证据：internal/backups/service_import_test.go:80-137、238-287；go test -race -count=1 ./internal/backups ./internal/models ./internal/api/handlers ./internal/api。
+Rubric ID：2｜状态：通过｜期望行为：任一缺失文件补取失败或实例不可用时，条目错误和运行失败状态可查询，绝不误报成功。｜实际观察：qBittorrent 返回 500 时对应条目标记 failed 并保存错误文本，另一个条目标记 available，运行终态为 failed 且错误摘要为 1 of 2；无 reader 时运行同样进入 failed。｜直接证据：internal/backups/service_import_test.go:140-235、364-386；internal/backups/service.go:2172-2225。
+Rubric ID：3｜状态：通过｜期望行为：同一运行重试只处理尚未恢复的条目，已完成条目和已存在文件不重复写入。｜实际观察：重试只增加失败条目的 qBittorrent 调用次数，已完成条目的 sentinel 文件内容保持不变；运行中的第二次重试返回 ErrImportRecoveryActive。｜直接证据：internal/backups/service_import_test.go:140-235、407-444；internal/backups/service.go:2027-2101、2348-2413。
+Rubric ID：4｜状态：通过｜期望行为：进程在后台补取期间退出后，重新启动能依据持久化状态继续或明确失败，不能留下静默 pending。｜实际观察：取消恢复上下文后运行保持 running 且条目保持 pending；下一服务实例继续补取并将运行置为 success；没有条目的中断导入被置为 failed 并写入错误信息。｜直接证据：internal/backups/service_import_test.go:289-362；internal/backups/service.go:353-441。
+Rubric ID：5｜状态：未通过｜期望行为：运行状态、条目进度、错误信息和完成事件在备份 API 及活动通知中保持一致。｜实际观察：RetryImportRun handler 在校验 URL 中 instanceID 归属前调用 service.RetryImportRun；对另一实例的已失败导入运行，请求先重置失败条目、更新运行状态并启动恢复，随后才返回 404。｜直接证据：internal/api/handlers/backups.go:751-784；internal/backups/service.go:2353-2413。原因：跨实例重试在归属校验前已经改变运行和条目状态并发送活动事件。｜影响：API 返回 404 与后台已发生的 running、pending 和恢复事件不一致，错误实例请求可触发目标实例的导入重试。｜证据位置：internal/api/handlers/backups.go:764-781；internal/backups/service.go:2365-2409。
+Rubric ID：6｜状态：通过｜期望行为：旧版清单可选字段、缓存命中和正常全量导入仍按原有兼容行为工作。｜实际观察：导入解析保留可选 category、tags、savePath、infohash 字段；缓存命中路径复用已有文件；迁移将存量条目标记为 available，并在恢复时重新核验缺失文件。｜直接证据：internal/backups/service.go:1840-1887、1945-1984、2310-2345；internal/database/migrations/104_add_backup_item_blob_status.sql；internal/backups/service_import_test.go:238-287。
+
+可复现验证摘要：go test -race -count=1 ./internal/backups ./internal/models ./internal/api/handlers ./internal/api 通过；go test -count=1 ./internal/web/swagger 通过；web pnpm exec tsc --noEmit 通过；完整 Vitest 1474/1476 通过，2 个失败位于未改动的 WorkflowDialog.test.tsx 与 useCrossSeedSearch.test.tsx。

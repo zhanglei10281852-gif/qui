@@ -1801,6 +1801,7 @@
         "restoreFromBackup": "Restaura els torrents d'aquesta còpia de seguretat",
         "downloadBackup": "Baixa l'arxiu de la còpia de seguretat",
         "downloadUnavailable": "La baixada no està disponible",
+        "retryImport": "Reintenta la recuperació dels fitxers torrent que falten",
         "deleteBackup": "Elimina aquesta còpia de seguretat"
       },
       "downloadFormats": {
@@ -1848,7 +1849,14 @@
       "backupDeleted": "S'ha eliminat l'execució de còpia de seguretat",
       "failedToDeleteBackup": "No s'ha pogut eliminar l'execució de còpia de seguretat",
       "allBackupsDeleted": "S'han eliminat totes les còpies de seguretat",
-      "failedToDeleteBackups": "No s'han pogut eliminar les còpies de seguretat"
+      "failedToDeleteBackups": "No s'han pogut eliminar les còpies de seguretat",
+      "importRetryStarted": "S'estan recuperant els fitxers torrent que falten…",
+      "failedToRetryImport": "No s'ha pogut reintentar la recuperació dels torrents"
+    },
+    "blobStatus": {
+      "available": "Recuperat",
+      "pending": "Recuperant…",
+      "failed": "Falta"
     }
   }
 }

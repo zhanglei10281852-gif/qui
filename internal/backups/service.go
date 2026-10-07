@@ -39,7 +39,13 @@ import (
 var (
 	// ErrInstanceBusy is returned when a backup is already running for the instance.
 	ErrInstanceBusy = errors.New("backup already running for this instance")
-	removeFile      = os.Remove
+	// ErrImportRunNotRetryable is returned when retry is requested for a run
+	// that was not created by a manifest import.
+	ErrImportRunNotRetryable = errors.New("run is not a manifest import")
+	// ErrImportRecoveryActive is returned while an import's blob recovery is
+	// still running; a second recovery for the same run is not allowed.
+	ErrImportRecoveryActive = errors.New("torrent recovery is already running for this import")
+	removeFile              = os.Remove
 )
 
 // Config controls background backup scheduling.
@@ -56,12 +62,6 @@ type BackupProgress struct {
 	Current    int
 	Total      int
 	Percentage float64
-}
-
-type missingTorrent struct {
-	hash    string
-	relPath string
-	absPath string
 }
 
 type Service struct {
@@ -87,6 +87,13 @@ type Service struct {
 
 	progress   map[int64]*BackupProgress
 	progressMu sync.RWMutex
+
+	// recovering tracks import runs whose background blob recovery goroutine
+	// is live in this process, so a retry cannot start a second writer for
+	// the same run. The DB blob_status columns are the durable counterpart;
+	// this map only guards in-process concurrency.
+	recovering   map[int64]struct{}
+	recoveringMu sync.Mutex
 
 	now func() time.Time
 
@@ -149,6 +156,11 @@ type ManifestItem struct {
 	Tags        []string `json:"tags,omitempty"`
 	TorrentBlob string   `json:"torrentBlob,omitempty"`
 	SavePath    string   `json:"savePath,omitempty"`
+	// BlobStatus/BlobError are populated on import responses from the
+	// per-item recovery state. They are never trusted when importing a
+	// manifest: availability is recomputed from the archive and disk.
+	BlobStatus string  `json:"blobStatus,omitempty"`
+	BlobError  *string `json:"blobError,omitempty"`
 }
 
 func NewService(store *models.BackupStore, reader backupReader, cfg Config, notifier notifications.Notifier) *Service {
@@ -181,16 +193,17 @@ func NewService(store *models.BackupStore, reader backupReader, cfg Config, noti
 	}
 
 	svc := &Service{
-		store:    store,
-		reader:   reader,
-		notifier: notifier,
-		cfg:      cfg,
-		root:     root,
-		cacheDir: cacheDir,
-		jobs:     make(chan job, cfg.WorkerCount*2),
-		inflight: make(map[int]int64),
-		progress: make(map[int64]*BackupProgress),
-		now:      func() time.Time { return time.Now().UTC() },
+		store:      store,
+		reader:     reader,
+		notifier:   notifier,
+		cfg:        cfg,
+		root:       root,
+		cacheDir:   cacheDir,
+		jobs:       make(chan job, cfg.WorkerCount*2),
+		inflight:   make(map[int]int64),
+		progress:   make(map[int64]*BackupProgress),
+		recovering: make(map[int64]struct{}),
+		now:        func() time.Time { return time.Now().UTC() },
 
 		activityPublisher: activity.NopPublisher{},
 	}
@@ -337,8 +350,11 @@ func (s *Service) Start(ctx context.Context) {
 	go s.scheduler(ctx)
 }
 
-// recoverIncompleteRuns marks any pending or running backup runs as failed.
-// This handles the case where qui was restarted while backups were in progress.
+// recoverIncompleteRuns settles pending/running runs left by a previous
+// process. Live backups cannot resume, so they fail; manifest imports can,
+// because every item's blob state is persisted and the missing blobs are
+// fetched from qBittorrent, so their background recovery is resumed from
+// that state instead of failing the run or dropping the missing items.
 func (s *Service) recoverIncompleteRuns(ctx context.Context) error {
 	incompleteRuns, err := s.store.FindIncompleteRuns(ctx)
 	if err != nil {
@@ -354,40 +370,74 @@ func (s *Service) recoverIncompleteRuns(ctx context.Context) error {
 	now := s.now()
 	errorMsg := "Backup interrupted by application restart"
 
-	// Collect all run IDs to update
-	runIDs := make([]int64, len(incompleteRuns))
-	for i, run := range incompleteRuns {
-		runIDs[i] = run.ID
+	var interruptedRunIDs []int64
+	for _, run := range incompleteRuns {
+		if run.Kind == models.BackupRunKindImport {
+			run := run
+			s.wg.Go(func() {
+				s.resumeImportRecovery(ctx, run)
+			})
+			continue
+		}
+		interruptedRunIDs = append(interruptedRunIDs, run.ID)
 	}
 
 	// Process runIDs in chunks to avoid SQLite bind parameter limits
 	const chunkSize = 1000
-	totalChunks := (len(runIDs) + chunkSize - 1) / chunkSize
+	for i := 0; i < len(interruptedRunIDs); i += chunkSize {
+		end := min(i+chunkSize, len(interruptedRunIDs))
+		chunk := interruptedRunIDs[i:end]
 
-	for i := 0; i < len(runIDs); i += chunkSize {
-		end := min(i+chunkSize, len(runIDs))
-		chunk := runIDs[i:end]
-		chunkNum := (i / chunkSize) + 1
-
-		log.Debug().
-			Int("chunk", chunkNum).
-			Int("total_chunks", totalChunks).
-			Int("chunk_size", len(chunk)).
-			Msg("Updating backup run status chunk")
-
-		err = s.store.UpdateMultipleRunsStatus(ctx, chunk, models.BackupRunStatusFailed, &now, &errorMsg)
-		if err != nil {
-			return fmt.Errorf("failed to update incomplete runs (chunk %d/%d): %w", chunkNum, totalChunks, err)
+		if err := s.store.UpdateMultipleRunsStatus(ctx, chunk, models.BackupRunStatusFailed, &now, &errorMsg); err != nil {
+			return fmt.Errorf("failed to update incomplete runs: %w", err)
 		}
 	}
 
-	log.Info().Int("count", len(incompleteRuns)).Msg("Successfully recovered incomplete backup runs")
-
-	// Notify connected clients that these runs transitioned to failed.
+	// Notify connected clients that the interrupted live runs transitioned.
 	for _, run := range incompleteRuns {
+		if run.Kind == models.BackupRunKindImport {
+			continue
+		}
 		s.emitRunActivity(run.InstanceID, run.ID)
 	}
 	return nil
+}
+
+// resumeImportRecovery continues an import run interrupted mid-recovery.
+// Persisted blob_status drives the outcome: pending items are fetched again,
+// previously failed items stay failed, available items stay untouched. Runs
+// that crashed before their items were inserted have nothing to resume and
+// fail deterministically.
+func (s *Service) resumeImportRecovery(ctx context.Context, run *models.BackupRun) {
+	itemCount, err := s.store.CountItems(ctx, run.ID)
+	if err != nil {
+		log.Error().Err(err).Int64("runID", run.ID).Msg("Failed to count items while resuming import recovery")
+		return
+	}
+	if itemCount == 0 {
+		now := s.now()
+		msg := "Import interrupted by application restart before items were saved"
+		if err := s.store.UpdateRunMetadata(ctx, run.ID, func(r *models.BackupRun) error {
+			r.Status = models.BackupRunStatusFailed
+			r.CompletedAt = &now
+			r.ErrorMessage = &msg
+			return nil
+		}); err != nil {
+			log.Error().Err(err).Int64("runID", run.ID).Msg("Failed to fail interrupted import run")
+		}
+		s.emitRunActivity(run.InstanceID, run.ID)
+		return
+	}
+
+	// Imports from versions before per-item blob_status have every row
+	// defaulted to "available", including blobs that were never fetched.
+	// Re-verify those files once so a missing blob moves back to pending
+	// instead of letting the run report success with files still missing.
+	if err := s.reverifyAvailableBlobs(ctx, run.InstanceID, run.ID); err != nil {
+		log.Error().Err(err).Int64("runID", run.ID).Msg("Failed to re-verify blobs while resuming import recovery")
+	}
+
+	s.runImportRecovery(run.ID, run.InstanceID, []models.BackupItemBlobStatus{models.BackupBlobPending})
 }
 
 func (s *Service) isBackupMissed(ctx context.Context, instanceID int, kind models.BackupRunKind, enabled bool, now time.Time) bool {
@@ -1716,6 +1766,10 @@ func (s *Service) LoadManifest(ctx context.Context, runID int64) (*Manifest, err
 		if item.TorrentBlobPath != nil {
 			entry.TorrentBlob = *item.TorrentBlobPath
 		}
+		if item.BlobStatus != "" {
+			entry.BlobStatus = string(item.BlobStatus)
+		}
+		entry.BlobError = item.BlobError
 		if item.SavePath != nil {
 			entry.SavePath = *item.SavePath
 		}
@@ -1725,18 +1779,20 @@ func (s *Service) LoadManifest(ctx context.Context, runID int64) (*Manifest, err
 	return manifest, nil
 }
 
-// ImportManifestFromDir imports a backup manifest with torrent files from temp paths.
-// torrentPaths is a map of archivePath -> absolute temp file path on disk.
-// The caller is responsible for cleaning up the temp files after this returns.
+// ImportManifestFromDir imports a backup manifest with torrent files from
+// temp paths. torrentPaths is a map of archivePath -> absolute temp file path
+// on disk. The caller is responsible for cleaning up the temp files after
+// this returns.
+//
+// Every item that references a torrent blob is classified up front: shipped
+// in the archive, already present on disk, or reusable from another run's
+// cache becomes available immediately; anything still missing is persisted
+// as pending and recovered from the source qBittorrent instance in the
+// background. The run only reports success once no pending or failed items
+// remain, so the returned run may be "running"; poll it or wait for the
+// activity event for the terminal state.
 func (s *Service) ImportManifestFromDir(ctx context.Context, instanceID int, manifestData []byte, requestedBy string, torrentPaths map[string]string) (*models.BackupRun, error) {
-	// Use local variable to avoid mutating shared config (thread-safety)
-	rootDir := s.root
-
-	// Normalize the backup root for Windows Git Bash paths
-	if runtime.GOOS == "windows" && strings.HasPrefix(rootDir, "/c/") {
-		rootDir = "C:" + strings.ReplaceAll(strings.TrimPrefix(rootDir, "/c"), "/", "\\")
-		log.Info().Str("normalizedBackupDir", rootDir).Msg("Normalized backup directory for Windows")
-	}
+	rootDir := s.normalizedImportRoot()
 
 	log.Info().Int("instanceID", instanceID).Str("requestedBy", requestedBy).Int("dataSize", len(manifestData)).Int("torrentPaths", len(torrentPaths)).Str("backupDir", rootDir).Msg("Starting manifest import from dir")
 
@@ -1748,21 +1804,17 @@ func (s *Service) ImportManifestFromDir(ctx context.Context, instanceID int, man
 
 	log.Info().Int("manifestItemCount", len(manifest.Items)).Int("manifestTorrentCount", manifest.TorrentCount).Msg("Manifest parsed successfully")
 
-	// Create a backup run record for the import
+	started := s.now()
 	run := &models.BackupRun{
-		InstanceID:   instanceID,
-		Kind:         models.BackupRunKind(manifest.Kind),
-		Status:       models.BackupRunStatusRunning,
-		RequestedBy:  requestedBy,
-		RequestedAt:  manifest.GeneratedAt,
-		CompletedAt:  nil,
-		TotalBytes:   0,
-		TorrentCount: 0,
-		Categories:   manifest.Categories,
-		Tags:         manifest.Tags,
+		InstanceID:  instanceID,
+		Kind:        models.BackupRunKindImport,
+		Status:      models.BackupRunStatusRunning,
+		RequestedBy: requestedBy,
+		RequestedAt: manifest.GeneratedAt,
+		StartedAt:   &started,
+		Categories:  manifest.Categories,
+		Tags:        manifest.Tags,
 	}
-
-	log.Info().Int("instanceID", instanceID).Str("kind", string(run.Kind)).Msg("Creating backup run for import")
 
 	if err := s.store.CreateRun(ctx, run); err != nil {
 		log.Error().Err(err).Int("instanceID", instanceID).Msg("Failed to create import run")
@@ -1772,14 +1824,8 @@ func (s *Service) ImportManifestFromDir(ctx context.Context, instanceID int, man
 	log.Info().Int64("runID", run.ID).Msg("Backup run created successfully")
 	s.emitRunActivity(instanceID, run.ID)
 
-	// Convert manifest items to backup items
 	items := make([]models.BackupItem, 0, len(manifest.Items))
-	var totalBytes int64
-	var totalTorrentFileBytes int64
-
-	var missing []missingTorrent
-
-	log.Info().Int("totalItems", len(manifest.Items)).Msg("Starting to process manifest items")
+	pendingCount := 0
 
 	for i, item := range manifest.Items {
 		// Skip items with invalid required fields
@@ -1787,7 +1833,6 @@ func (s *Service) ImportManifestFromDir(ctx context.Context, instanceID int, man
 			continue
 		}
 
-		// Log progress every 100 items
 		if i > 0 && i%100 == 0 {
 			log.Info().Int("processed", i).Int("total", len(manifest.Items)).Int("validSoFar", len(items)).Msg("Processing manifest items progress")
 		}
@@ -1824,47 +1869,24 @@ func (s *Service) ImportManifestFromDir(ctx context.Context, instanceID int, man
 			backupItem.SavePath = &savePath
 		}
 
-		if item.TorrentBlob != "" {
-			// Validate blob path to prevent directory traversal
-			slashRel := backupRelPath(item.TorrentBlob)
-			if slashRel == "" {
+		if strings.TrimSpace(item.TorrentBlob) != "" {
+			status, storedPath := s.classifyImportedBlob(ctx, instanceID, rootDir, item, torrentPaths)
+			if storedPath == "" {
 				log.Warn().Str("hash", item.Hash).Str("blob", item.TorrentBlob).Msg("Ignoring unsafe TorrentBlob path from manifest")
-				items = append(items, backupItem)
-				totalBytes += item.SizeBytes
-				continue
-			}
-
-			stored := path.Join("backups", slashRel)
-			backupItem.TorrentBlobPath = &stored
-			rel := filepath.FromSlash(slashRel)
-			absPath := filepath.Join(rootDir, rel)
-
-			// Check if torrent file path was provided from temp directory
-			if torrentPaths != nil && item.ArchivePath != "" {
-				if tempPath, ok := torrentPaths[item.ArchivePath]; ok {
-					err := s.copyTorrentFromTemp(tempPath, rootDir, rel)
-					if err == nil {
-						if info, statErr := os.Stat(absPath); statErr == nil {
-							totalTorrentFileBytes += info.Size()
-						}
-						log.Debug().Str("hash", item.Hash).Str("archivePath", item.ArchivePath).Msg("Imported torrent from temp")
-						items = append(items, backupItem)
-						totalBytes += item.SizeBytes
-						continue
-					}
-					log.Warn().Err(err).Str("hash", item.Hash).Msg("Failed to copy from temp, will try qBittorrent")
+			} else {
+				stored := storedPath
+				backupItem.TorrentBlobPath = &stored
+				backupItem.BlobStatus = status
+				if status == models.BackupBlobPending {
+					pendingCount++
 				}
 			}
-
-			// Mark for background download from qBittorrent
-			missing = append(missing, missingTorrent{hash: item.Hash, relPath: rel, absPath: absPath})
 		}
 
 		items = append(items, backupItem)
-		totalBytes += item.SizeBytes
 	}
 
-	log.Info().Int("validItems", len(items)).Int64("totalBytes", totalBytes).Msg("Finished processing manifest items")
+	log.Info().Int("validItems", len(items)).Int("pendingBlobs", pendingCount).Msg("Finished processing manifest items")
 
 	// Validate that we have valid items if the manifest claimed to have any
 	if len(items) == 0 && len(manifest.Items) > 0 {
@@ -1872,9 +1894,7 @@ func (s *Service) ImportManifestFromDir(ctx context.Context, instanceID int, man
 		return nil, fmt.Errorf("manifest contains %d items but none are valid (missing required hash or name)", len(manifest.Items))
 	}
 
-	// Insert the items
 	if len(items) > 0 {
-		log.Info().Int("itemCount", len(items)).Int64("runID", run.ID).Msg("Inserting backup items into database")
 		if err := s.store.InsertItems(ctx, run.ID, items); err != nil {
 			log.Error().Err(err).Int64("runID", run.ID).Msg("Failed to insert backup items")
 			return nil, fmt.Errorf("failed to insert backup items: %w", err)
@@ -1882,50 +1902,85 @@ func (s *Service) ImportManifestFromDir(ctx context.Context, instanceID int, man
 		log.Info().Int("insertedItems", len(items)).Int64("runID", run.ID).Msg("Successfully inserted backup items")
 	}
 
-	// Start background download of missing torrents
-	if len(missing) > 0 {
-		log.Info().Int("missingCount", len(missing)).Msg("Starting background download of missing torrent blobs")
-		s.progressMu.Lock()
-		s.progress[run.ID] = &BackupProgress{
-			Current: 0,
-			Total:   len(missing),
-		}
-		s.progressMu.Unlock()
-		log.Info().Int64("runID", run.ID).Int("total", len(missing)).Msg("Initialized import progress")
-		s.wg.Go(func() {
-			s.downloadMissingTorrents(run.ID, instanceID, rootDir, missing)
-		})
-	} else {
-		// No missing torrents, mark as completed immediately
-		now := s.now()
-		run.Status = models.BackupRunStatusSuccess
-		run.CompletedAt = &now
-		if err := s.store.UpdateRunMetadata(ctx, run.ID, func(r *models.BackupRun) error {
-			r.Status = models.BackupRunStatusSuccess
-			r.CompletedAt = &now
-			return nil
-		}); err != nil {
-			log.Warn().Err(err).Int64("runID", run.ID).Msg("Failed to mark import run as completed")
-		}
-		s.emitRunActivity(instanceID, run.ID)
-	}
-
-	// Update the run with total bytes and torrent count
-	run.TotalBytes = totalTorrentFileBytes
-	run.TorrentCount = len(items)
-	log.Info().Int64("runID", run.ID).Int("torrentCount", len(items)).Int64("totalTorrentFileBytes", totalTorrentFileBytes).Msg("Updating backup run metadata")
 	if err := s.store.UpdateRunMetadata(ctx, run.ID, func(r *models.BackupRun) error {
-		r.TotalBytes = totalTorrentFileBytes
 		r.TorrentCount = len(items)
 		return nil
 	}); err != nil {
-		log.Warn().Err(err).Int64("runID", run.ID).Msg("Failed to update total bytes and torrent count for imported run")
-	} else {
-		log.Info().Int64("runID", run.ID).Msg("Successfully updated backup run metadata")
+		log.Warn().Err(err).Int64("runID", run.ID).Msg("Failed to update torrent count for imported run")
 	}
 
-	log.Info().Int64("runID", run.ID).Msg("Manifest import from dir completed successfully")
-	return run, nil
+	if pendingCount == 0 {
+		// Everything the manifest references is already available: finish now.
+		s.finalizeImportRun(instanceID, run.ID)
+	} else {
+		log.Info().Int("pendingCount", pendingCount).Int64("runID", run.ID).Msg("Starting background recovery of missing torrent blobs")
+		s.progressMu.Lock()
+		s.progress[run.ID] = &BackupProgress{Current: 0, Total: pendingCount}
+		s.progressMu.Unlock()
+		s.wg.Go(func() {
+			s.runImportRecovery(run.ID, instanceID, []models.BackupItemBlobStatus{models.BackupBlobPending})
+		})
+	}
+
+	return s.store.GetRun(ctx, run.ID)
+}
+
+// normalizedImportRoot returns the backup root with the Windows Git Bash
+// "/c/..." mount form translated to a native Windows path.
+func (s *Service) normalizedImportRoot() string {
+	rootDir := s.root
+	if runtime.GOOS == "windows" && strings.HasPrefix(rootDir, "/c/") {
+		rootDir = "C:" + strings.ReplaceAll(strings.TrimPrefix(rootDir, "/c"), "/", "\\")
+		log.Info().Str("normalizedBackupDir", rootDir).Msg("Normalized backup directory for Windows")
+	}
+	return rootDir
+}
+
+// classifyImportedBlob decides the initial recovery state for one manifest
+// item's blob. The returned storedPath is the blob reference to persist; ""
+// means the manifest path was unsafe and must not be referenced. Resolution
+// order: the file the archive shipped, the file already at the declared
+// location, a blob cached for the hash by another run, and finally background
+// recovery from qBittorrent.
+func (s *Service) classifyImportedBlob(ctx context.Context, instanceID int, rootDir string, item ManifestItem, torrentPaths map[string]string) (models.BackupItemBlobStatus, string) {
+	slashRel := backupRelPath(item.TorrentBlob)
+	if slashRel == "" {
+		return models.BackupBlobAvailable, ""
+	}
+
+	declaredStored := path.Join("backups", slashRel)
+	rel := filepath.FromSlash(slashRel)
+	absPath := filepath.Join(rootDir, rel)
+
+	// 1. Torrent shipped inside the uploaded archive.
+	if torrentPaths != nil && item.ArchivePath != "" {
+		if tempPath, ok := torrentPaths[item.ArchivePath]; ok {
+			if err := s.copyTorrentFromTemp(tempPath, rootDir, rel); err == nil {
+				log.Debug().Str("hash", item.Hash).Str("archivePath", item.ArchivePath).Msg("Imported torrent from uploaded archive")
+				return models.BackupBlobAvailable, declaredStored
+			} else {
+				log.Warn().Err(err).Str("hash", item.Hash).Msg("Failed to copy torrent from archive, resolving it another way")
+			}
+		}
+	}
+
+	// 2. Already present at the declared location (idempotent re-import).
+	if info, err := os.Stat(absPath); err == nil && !info.IsDir() {
+		log.Debug().Str("hash", item.Hash).Str("path", absPath).Msg("Torrent blob already on disk, reusing it")
+		return models.BackupBlobAvailable, declaredStored
+	}
+
+	// 3. Another run of this instance already cached the same hash.
+	// Reference that blob instead of writing a duplicate file.
+	if cached, err := s.loadCachedTorrent(ctx, instanceID, item.Hash); err != nil {
+		log.Warn().Err(err).Str("hash", item.Hash).Msg("Failed to look up cached torrent blob")
+	} else if cached != nil {
+		log.Debug().Str("hash", item.Hash).Str("blobPath", cached.relPath).Msg("Reusing cached torrent blob for import")
+		return models.BackupBlobAvailable, cached.relPath
+	}
+
+	// 4. Missing: background recovery fetches it from qBittorrent.
+	return models.BackupBlobPending, declaredStored
 }
 
 // copyTorrentFromTemp validates a torrent from the import temp dir and caches
@@ -1946,105 +2001,416 @@ func (s *Service) copyTorrentFromTemp(srcPath, rootDir, relPath string) error {
 	return cacheTorrentBlob(rootDir, relPath, data)
 }
 
-// downloadMissingTorrents downloads torrent blobs in the background for
-// imported manifests. rootDir is the import's normalized backup root, the
-// same root missingTorrent.absPath was built from.
-func (s *Service) downloadMissingTorrents(runID int64, instanceID int, rootDir string, missing []missingTorrent) {
-	if s.reader == nil {
-		log.Warn().Int64("runID", runID).Msg("No sync manager available for background torrent downloads")
-		s.markImportComplete(instanceID, runID)
+func (s *Service) serviceContext() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+func (s *Service) tryBeginRecovery(runID int64) bool {
+	s.recoveringMu.Lock()
+	defer s.recoveringMu.Unlock()
+	if _, ok := s.recovering[runID]; ok {
+		return false
+	}
+	s.recovering[runID] = struct{}{}
+	return true
+}
+
+func (s *Service) endRecovery(runID int64) {
+	s.recoveringMu.Lock()
+	delete(s.recovering, runID)
+	s.recoveringMu.Unlock()
+}
+
+// runImportRecovery fetches every unresolved blob of an import run. The work
+// set comes from the DB in the given statuses, so retries and post-restart
+// resumes never rewrite completed items. It finalizes the run when the set is
+// exhausted; on context cancellation it leaves the run running and the
+// unprocessed rows pending for the next start to resume.
+func (s *Service) runImportRecovery(runID int64, instanceID int, statuses []models.BackupItemBlobStatus) {
+	if !s.tryBeginRecovery(runID) {
+		log.Info().Int64("runID", runID).Msg("Import blob recovery already in progress, skipping duplicate start")
+		return
+	}
+	defer s.endRecovery(runID)
+
+	// Local DB writes must survive shutdown: a fetched blob whose state flip
+	// were canceled would look missing forever. Only the qBittorrent export
+	// and the between-items stop observe the shutdown context.
+	ctx := s.serviceContext()
+	dbCtx := context.Background()
+
+	items, err := s.store.ListItemsForBlobRecovery(dbCtx, runID, statuses)
+	if err != nil {
+		s.failImportRecovery(instanceID, runID, fmt.Errorf("load pending torrent files: %w", err))
+		return
+	}
+	if len(items) == 0 {
+		s.finalizeImportRun(instanceID, runID)
 		return
 	}
 
-	total := len(missing)
-	log.Info().Int("total", total).Int64("runID", runID).Int("instanceID", instanceID).Msg("Starting background download of missing torrent blobs")
-
-	successCount := 0
-	var totalTorrentBytes int64
-	for i, mt := range missing {
-		// Check for shutdown
-		if s.ctx != nil {
-			select {
-			case <-s.ctx.Done():
-				log.Info().Int64("runID", runID).Int("completed", successCount).Int("total", total).Msg("Background download cancelled due to shutdown")
-				s.markImportComplete(instanceID, runID)
-				return
-			default:
-			}
+	// A retry flips a failed run back to running; clear terminal markers.
+	now := s.now()
+	if err := s.store.UpdateRunMetadata(dbCtx, runID, func(r *models.BackupRun) error {
+		r.Status = models.BackupRunStatusRunning
+		r.CompletedAt = nil
+		r.ErrorMessage = nil
+		if r.StartedAt == nil {
+			started := now
+			r.StartedAt = &started
 		}
-
-		// Check if file already exists
-		if info, err := os.Stat(mt.absPath); err == nil {
-			sz := info.Size()
-			log.Trace().Int("current", i+1).Int("total", total).Int64("runID", runID).Str("hash", mt.hash).Str("path", mt.absPath).Int64("size", sz).Msg("Torrent blob already exists, skipping download")
-			totalTorrentBytes += sz
-			successCount++
-			s.updateProgress(runID, i+1)
-			continue
-		}
-
-		log.Trace().Int("current", i+1).Int("total", total).Int64("runID", runID).Str("hash", mt.hash).Str("path", mt.absPath).Msg("Downloading missing torrent blob in background")
-		ctx := s.ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		if data, _, _, err := s.reader.ExportTorrent(ctx, instanceID, mt.hash); err == nil {
-			if err := cacheTorrentBlob(rootDir, mt.relPath, data); err == nil {
-				log.Trace().Int("downloaded", successCount+1).Int("total", total).Int64("runID", runID).Str("hash", mt.hash).Str("path", mt.absPath).Msg("Successfully cached missing torrent blob")
-				totalTorrentBytes += int64(len(data))
-				successCount++
-				s.updateProgress(runID, i+1)
-			} else {
-				log.Error().Err(err).Int("downloaded", successCount).Int("total", total).Int64("runID", runID).Str("hash", mt.hash).Str("path", mt.absPath).Msg("Failed to cache missing torrent blob")
-				s.updateProgress(runID, i+1)
-			}
-		} else {
-			log.Warn().Err(err).Int("downloaded", successCount).Int("total", total).Int64("runID", runID).Str("hash", mt.hash).Msg("Failed to download missing torrent blob from client")
-			s.updateProgress(runID, i+1)
-		}
-	}
-
-	log.Info().Int("completed", successCount).Int("total", total).Int64("runID", runID).Msg("Completed background download of missing torrent blobs")
-
-	log.Info().Int64("totalTorrentBytes", totalTorrentBytes).Int64("runID", runID).Msg("Calculated total torrent file bytes")
-
-	// Update run metadata with actual torrent file sizes
-	ctx := context.Background()
-	if err := s.store.UpdateRunMetadata(ctx, runID, func(r *models.BackupRun) error {
-		r.TotalBytes = totalTorrentBytes
 		return nil
 	}); err != nil {
-		log.Error().Err(err).Int64("runID", runID).Msg("Failed to update run with torrent file sizes")
-	} else {
-		log.Info().Int64("runID", runID).Int64("totalBytes", totalTorrentBytes).Msg("Updated run metadata with torrent file sizes")
+		s.failImportRecovery(instanceID, runID, fmt.Errorf("mark import running: %w", err))
+		return
+	}
+	s.emitRunActivity(instanceID, runID)
+
+	s.progressMu.Lock()
+	s.progress[runID] = &BackupProgress{Current: 0, Total: len(items)}
+	s.progressMu.Unlock()
+
+	log.Info().Int("total", len(items)).Int64("runID", runID).Int("instanceID", instanceID).Msg("Recovering missing torrent blobs")
+
+	for i, item := range items {
+		if err := ctx.Err(); err != nil {
+			log.Info().Err(err).Int("processed", i).Int("total", len(items)).Int64("runID", runID).Msg("Import blob recovery interrupted; pending items resume on next start")
+			return
+		}
+
+		status, errMsg, repoint := s.acquireImportedBlob(ctx, instanceID, item)
+		if err := s.store.UpdateItemBlobState(dbCtx, item.ID, status, errMsg, repoint); err != nil {
+			// Without the persisted result the item still reads pending, so
+			// stop with a visible failure instead of silently dropping it.
+			s.failImportRecovery(instanceID, runID, fmt.Errorf("persist recovery state for torrent %s: %w", item.TorrentHash, err))
+			return
+		}
+
+		switch status {
+		case models.BackupBlobAvailable:
+			log.Debug().Int("current", i+1).Int("total", len(items)).Int64("runID", runID).Str("hash", item.TorrentHash).Msg("Recovered torrent blob")
+		default:
+			log.Warn().Str("error", derefString(errMsg)).Int("current", i+1).Int("total", len(items)).Int64("runID", runID).Str("hash", item.TorrentHash).Msg("Failed to recover torrent blob")
+		}
+		s.updateProgress(runID, i+1)
 	}
 
-	s.markImportComplete(instanceID, runID)
+	s.finalizeImportRun(instanceID, runID)
 }
 
-// markImportComplete marks an import run as completed and cleans up progress
-func (s *Service) markImportComplete(instanceID int, runID int64) {
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	// Update run status in database
-	if err := s.store.UpdateRunMetadata(ctx, runID, func(r *models.BackupRun) error {
-		r.Status = models.BackupRunStatusSuccess
-		r.CompletedAt = &now
-		return nil
-	}); err != nil {
-		log.Error().Err(err).Int64("runID", runID).Msg("Failed to mark import run as completed")
-	} else {
-		log.Info().Int64("runID", runID).Msg("Marked import run as completed")
+// acquireImportedBlob resolves one item's blob without consulting its current
+// status; the caller only invokes it for unresolved rows. A non-nil repoint
+// path means the row should reference an already cached blob rather than the
+// declared (missing) location.
+func (s *Service) acquireImportedBlob(ctx context.Context, instanceID int, item *models.BackupItem) (models.BackupItemBlobStatus, *string, *string) {
+	if item.TorrentBlobPath == nil || strings.TrimSpace(*item.TorrentBlobPath) == "" {
+		return models.BackupBlobAvailable, nil, nil
 	}
 
-	// Clean up progress
+	// The blob appeared at the referenced location meanwhile (another import
+	// or a previous attempt that wrote the file before the crash).
+	if absPath := s.ResolveBackupPath(*item.TorrentBlobPath); absPath != "" {
+		if info, err := os.Stat(absPath); err == nil && !info.IsDir() {
+			return models.BackupBlobAvailable, nil, nil
+		}
+	}
+
+	// Reuse a cached blob belonging to any run of this instance.
+	if cached, err := s.loadCachedTorrent(ctx, instanceID, item.TorrentHash); err != nil {
+		log.Warn().Err(err).Str("hash", item.TorrentHash).Msg("Failed to look up cached torrent blob")
+	} else if cached != nil {
+		repoint := cached.relPath
+		return models.BackupBlobAvailable, nil, &repoint
+	}
+
+	if s.reader == nil {
+		msg := "qBittorrent connection unavailable; torrent export is not configured"
+		return models.BackupBlobFailed, &msg, nil
+	}
+
+	data, _, _, err := s.reader.ExportTorrent(ctx, instanceID, item.TorrentHash)
+	if err != nil {
+		msg := sanitizeBlobError(err)
+		return models.BackupBlobFailed, &msg, nil
+	}
+
+	rel := filepath.FromSlash(backupRelPath(*item.TorrentBlobPath))
+	if rel == "" || rel == "." {
+		msg := "unsafe torrent blob path in manifest"
+		return models.BackupBlobFailed, &msg, nil
+	}
+	if err := cacheTorrentBlob(s.root, rel, data); err != nil {
+		msg := sanitizeBlobError(err)
+		return models.BackupBlobFailed, &msg, nil
+	}
+
+	return models.BackupBlobAvailable, nil, nil
+}
+
+const maxBlobErrorLen = 500
+
+// sanitizeBlobError turns a client/write error into a compact one-line
+// per-item failure reason suitable for storage and display.
+func sanitizeBlobError(err error) string {
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if len(msg) > maxBlobErrorLen {
+		msg = msg[:maxBlobErrorLen]
+	}
+	return msg
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+// finalizeImportRun moves an import run to its terminal state based on the
+// persisted per-item results. Pending items keep the run running (recovery
+// was interrupted); any failure fails the whole run with a visible summary;
+// only full availability reports success.
+func (s *Service) finalizeImportRun(instanceID int, runID int64) {
+	ctx := context.Background()
+	counts, err := s.store.CountItemsByBlobStatus(ctx, runID)
+	if err != nil {
+		s.failImportRecovery(instanceID, runID, fmt.Errorf("count torrent recovery state: %w", err))
+		return
+	}
+	if counts.Pending > 0 {
+		log.Info().Int("pending", counts.Pending).Int64("runID", runID).Msg("Import still has unresolved torrent blobs; run remains running")
+		return
+	}
+
+	now := s.now()
+	status := models.BackupRunStatusSuccess
+	var errMsg *string
+	if counts.Failed > 0 {
+		status = models.BackupRunStatusFailed
+		msg := fmt.Sprintf("%d of %d torrent file(s) could not be recovered from qBittorrent; retry the import once the instance is reachable.", counts.Failed, counts.Tracked)
+		errMsg = &msg
+	}
+
+	totalBytes := s.sumAvailableBlobBytes(ctx, runID)
+
+	var kind models.BackupRunKind
+	var torrentCount int
+	if err := s.store.UpdateRunMetadata(ctx, runID, func(r *models.BackupRun) error {
+		kind = r.Kind
+		torrentCount = r.TorrentCount
+		r.Status = status
+		r.CompletedAt = &now
+		r.ErrorMessage = errMsg
+		r.TotalBytes = totalBytes
+		return nil
+	}); err != nil {
+		log.Error().Err(err).Int64("runID", runID).Msg("Failed to finalize import run")
+		return
+	}
+
 	s.progressMu.Lock()
 	delete(s.progress, runID)
 	s.progressMu.Unlock()
 
-	// Notify connected clients after the progress lock is released.
+	log.Info().Str("status", string(status)).Int("failed", counts.Failed).Int("tracked", counts.Tracked).Int64("runID", runID).Msg("Import run finalized")
 	s.emitRunActivity(instanceID, runID)
+
+	if status == models.BackupRunStatusFailed {
+		s.notify(ctx, notifications.Event{
+			Type:         notifications.EventBackupFailed,
+			InstanceID:   instanceID,
+			BackupKind:   kind,
+			BackupRunID:  runID,
+			ErrorMessage: derefString(errMsg),
+			CompletedAt:  &now,
+		})
+		return
+	}
+	s.notify(ctx, notifications.Event{
+		Type:               notifications.EventBackupSucceeded,
+		InstanceID:         instanceID,
+		BackupKind:         kind,
+		BackupRunID:        runID,
+		BackupTorrentCount: torrentCount,
+		CompletedAt:        &now,
+	})
+}
+
+// failImportRecovery forces an import run to a visible failed state when the
+// recovery machinery itself cannot continue.
+func (s *Service) failImportRecovery(instanceID int, runID int64, cause error) {
+	ctx := context.Background()
+	log.Error().Err(cause).Int64("runID", runID).Msg("Import blob recovery failed")
+	now := s.now()
+	msg := cause.Error()
+
+	var kind models.BackupRunKind
+	_ = s.store.UpdateRunMetadata(ctx, runID, func(r *models.BackupRun) error {
+		kind = r.Kind
+		r.Status = models.BackupRunStatusFailed
+		r.CompletedAt = &now
+		r.ErrorMessage = &msg
+		return nil
+	})
+
+	s.progressMu.Lock()
+	delete(s.progress, runID)
+	s.progressMu.Unlock()
+
+	s.emitRunActivity(instanceID, runID)
+	s.notify(ctx, notifications.Event{
+		Type:         notifications.EventBackupFailed,
+		InstanceID:   instanceID,
+		BackupKind:   kind,
+		BackupRunID:  runID,
+		ErrorMessage: msg,
+		CompletedAt:  &now,
+	})
+}
+
+// sumAvailableBlobBytes sums on-disk sizes of the run's available blobs.
+// Distinct stored paths are counted once because several items may share a
+// content-addressed blob.
+func (s *Service) sumAvailableBlobBytes(ctx context.Context, runID int64) int64 {
+	items, err := s.store.ListItems(ctx, runID)
+	if err != nil {
+		log.Warn().Err(err).Int64("runID", runID).Msg("Failed to list items while computing import size")
+		return 0
+	}
+
+	seen := make(map[string]struct{}, len(items))
+	var total int64
+	for _, item := range items {
+		if item.TorrentBlobPath == nil {
+			continue
+		}
+		if item.BlobStatus != "" && item.BlobStatus != models.BackupBlobAvailable {
+			continue
+		}
+		stored := *item.TorrentBlobPath
+		if _, ok := seen[stored]; ok {
+			continue
+		}
+		seen[stored] = struct{}{}
+
+		absPath := s.ResolveBackupPath(stored)
+		if absPath == "" {
+			continue
+		}
+		if info, err := os.Stat(absPath); err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// reverifyAvailableBlobs re-checks "available" items against the disk and
+// moves any whose blob is missing back to pending (repointing at a cached
+// blob when one exists). It exists for imports created before per-item
+// blob_status existed, whose rows all defaulted to available regardless of
+// whether the background fetch ever finished.
+func (s *Service) reverifyAvailableBlobs(ctx context.Context, instanceID int, runID int64) error {
+	items, err := s.store.ListItems(ctx, runID)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.TorrentBlobPath == nil {
+			continue
+		}
+		if item.BlobStatus == models.BackupBlobPending || item.BlobStatus == models.BackupBlobFailed {
+			continue
+		}
+		if absPath := s.ResolveBackupPath(*item.TorrentBlobPath); absPath != "" {
+			if info, err := os.Stat(absPath); err == nil && !info.IsDir() {
+				continue
+			}
+		}
+
+		if cached, err := s.loadCachedTorrent(ctx, instanceID, item.TorrentHash); err == nil && cached != nil {
+			repoint := cached.relPath
+			if err := s.store.UpdateItemBlobState(ctx, item.ID, models.BackupBlobAvailable, nil, &repoint); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := s.store.UpdateItemBlobState(ctx, item.ID, models.BackupBlobPending, nil, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RetryImportRun resumes recovery for an existing import run. Only items not
+// already available are reprocessed: failed rows reset to pending, previously
+// pending rows stay pending, and completed rows are never touched. The run
+// returns in "running" while recovery proceeds; it settles to success or
+// failed like a fresh import.
+func (s *Service) RetryImportRun(ctx context.Context, runID int64) (*models.BackupRun, error) {
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if run.Kind != models.BackupRunKindImport {
+		return nil, ErrImportRunNotRetryable
+	}
+	if run.Status == models.BackupRunStatusPending || run.Status == models.BackupRunStatusRunning {
+		return nil, ErrImportRecoveryActive
+	}
+
+	if _, err := s.store.ResetFailedBlobItems(ctx, runID); err != nil {
+		return nil, fmt.Errorf("reset failed torrent files: %w", err)
+	}
+
+	counts, err := s.store.CountItemsByBlobStatus(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if counts.Pending == 0 && run.Status == models.BackupRunStatusFailed {
+		// Legacy imports predate blob_status; their rows look available even
+		// when the background fetch never wrote the files. Re-verify once.
+		if err := s.reverifyAvailableBlobs(ctx, run.InstanceID, runID); err != nil {
+			return nil, err
+		}
+		counts, err = s.store.CountItemsByBlobStatus(ctx, runID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if counts.Pending == 0 {
+		// Nothing left to fetch: recompute the terminal state from disk.
+		s.finalizeImportRun(run.InstanceID, runID)
+	} else {
+		// Flip synchronously so callers never observe the pre-retry failed
+		// state while the recovery goroutine is still starting.
+		now := s.now()
+		if err := s.store.UpdateRunMetadata(ctx, runID, func(r *models.BackupRun) error {
+			r.Status = models.BackupRunStatusRunning
+			r.CompletedAt = nil
+			r.ErrorMessage = nil
+			if r.StartedAt == nil {
+				started := now
+				r.StartedAt = &started
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("mark import running: %w", err)
+		}
+		s.progressMu.Lock()
+		s.progress[runID] = &BackupProgress{Current: 0, Total: counts.Pending}
+		s.progressMu.Unlock()
+		s.emitRunActivity(run.InstanceID, runID)
+		s.wg.Go(func() {
+			s.runImportRecovery(run.ID, run.InstanceID, []models.BackupItemBlobStatus{models.BackupBlobPending})
+		})
+	}
+
+	return s.store.GetRun(ctx, runID)
 }
 
 // backupRelPath normalizes a stored backup-relative path to a slash form

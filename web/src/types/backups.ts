@@ -51,6 +51,8 @@ export interface BackupRunsResponse {
   hasMore: boolean
 }
 
+export type BackupItemBlobStatus = "available" | "pending" | "failed"
+
 export interface BackupManifestItem {
   hash: string
   name: string
@@ -61,6 +63,8 @@ export interface BackupManifestItem {
   tags?: string[]
   torrentBlob?: string
   savePath?: string | null
+  blobStatus?: BackupItemBlobStatus
+  blobError?: string | null
 }
 
 export interface BackupCategorySnapshot {

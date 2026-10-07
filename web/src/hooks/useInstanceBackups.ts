@@ -165,3 +165,15 @@ export function useImportBackupManifest(instanceId: number) {
     },
   })
 }
+
+export function useRetryImportRecovery(instanceId: number) {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (runId: number) => api.retryImportRecovery(instanceId, runId),
+    onSuccess: (run: BackupRun) => {
+      queryClient.invalidateQueries({ queryKey: ["instance-backups", instanceId] })
+      prependRun(queryClient, instanceId, run)
+    },
+  })
+}

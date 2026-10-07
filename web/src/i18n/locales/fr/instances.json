@@ -1801,6 +1801,7 @@
         "restoreFromBackup": "Restaurer les torrents depuis cette sauvegarde",
         "downloadBackup": "Télécharger l'archive de sauvegarde",
         "downloadUnavailable": "Téléchargement indisponible",
+        "retryImport": "Réessayer les fichiers .torrent manquants",
         "deleteBackup": "Supprimer cette sauvegarde"
       },
       "downloadFormats": {
@@ -1848,7 +1849,14 @@
       "backupDeleted": "Exécution de sauvegarde supprimée",
       "failedToDeleteBackup": "Échec de la suppression de l'exécution de sauvegarde",
       "allBackupsDeleted": "Toutes les sauvegardes supprimées",
-      "failedToDeleteBackups": "Échec de la suppression des sauvegardes"
+      "failedToDeleteBackups": "Échec de la suppression des sauvegardes",
+      "importRetryStarted": "Récupération des fichiers .torrent manquants…",
+      "failedToRetryImport": "Échec de la nouvelle tentative de récupération des torrents"
+    },
+    "blobStatus": {
+      "available": "Récupéré",
+      "pending": "Récupération…",
+      "failed": "Manquant"
     }
   }
 }

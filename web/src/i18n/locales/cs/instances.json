@@ -1830,6 +1830,7 @@
         "restoreFromBackup": "Obnovit torrenty z této zálohy",
         "downloadBackup": "Stáhnout archiv zálohy",
         "downloadUnavailable": "Není možné stáhnout",
+        "retryImport": "Znovu získat chybějící soubory torrentů",
         "deleteBackup": "Smazat tuto zálohu"
       },
       "downloadFormats": {
@@ -1877,7 +1878,14 @@
       "backupDeleted": "Záloha smazána",
       "failedToDeleteBackup": "Selhalo smazání zálohy",
       "allBackupsDeleted": "Všechny zálohy smazány",
-      "failedToDeleteBackups": "Selhalo smazání záloh"
+      "failedToDeleteBackups": "Selhalo smazání záloh",
+      "importRetryStarted": "Získávání chybějících souborů torrentů…",
+      "failedToRetryImport": "Opětovné získání torrentů selhalo"
+    },
+    "blobStatus": {
+      "available": "Získáno",
+      "pending": "Získávání…",
+      "failed": "Chybí"
     },
     "statusLabels": {
       "pending": "Čeká",

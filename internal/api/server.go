@@ -715,6 +715,7 @@ func (s *Server) Handler() (*chi.Mux, error) {
 						r.Get("/runs/{runID}/download", backupsHandler.DownloadRun)
 						r.Post("/runs/{runID}/restore/preview", backupsHandler.PreviewRestore)
 						r.Post("/runs/{runID}/restore", backupsHandler.ExecuteRestore)
+						r.Post("/runs/{runID}/retry", backupsHandler.RetryImportRun)
 						r.Get("/runs/{runID}/items/{torrentHash}/download", backupsHandler.DownloadTorrentBlob)
 						r.Delete("/runs/{runID}", backupsHandler.DeleteRun)
 					})

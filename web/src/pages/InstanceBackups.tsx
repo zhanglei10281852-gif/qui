@@ -72,6 +72,7 @@ import {
   useExecuteRestore,
   useImportBackupManifest,
   usePreviewRestore,
+  useRetryImportRecovery,
   useTriggerBackup,
   useUpdateBackupSettings
 } from "@/hooks/useInstanceBackups"
@@ -254,6 +255,7 @@ export function InstanceBackups() {
   const previewRestore = usePreviewRestore(instanceId ?? 0)
   const executeRestore = useExecuteRestore(instanceId ?? 0)
   const importManifest = useImportBackupManifest(instanceId ?? 0)
+  const retryImport = useRetryImportRecovery(instanceId ?? 0)
   const { formatDate } = useDateTimeFormatters()
 
   const [formState, setFormState] = useState<SettingsFormState | null>(null)
@@ -646,6 +648,16 @@ export function InstanceBackups() {
       toast.success(t("backups.toasts.allBackupsDeleted"))
     } catch (error) {
       const message = error instanceof Error ? error.message : t("backups.toasts.failedToDeleteBackups")
+      toast.error(message)
+    }
+  }
+
+  const handleRetryImport = async (run: BackupRun) => {
+    try {
+      await retryImport.mutateAsync(run.id)
+      toast.success(t("backups.toasts.importRetryStarted"))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t("backups.toasts.failedToRetryImport")
       toast.error(message)
     }
   }
@@ -1808,7 +1820,23 @@ export function InstanceBackups() {
                               </p>
                             </div>
                           ) : (
-                            <Badge variant={statusVariants[run.status]} className="capitalize">{t(`backups.statusLabels.${run.status}`, run.status)}</Badge>
+                            <div className="flex flex-col gap-1">
+                              {run.errorMessage ? (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Badge variant={statusVariants[run.status]} className="capitalize w-fit">
+                                      {t(`backups.statusLabels.${run.status}`, run.status)}
+                                    </Badge>
+                                  </TooltipTrigger>
+                                  <TooltipContent>{run.errorMessage}</TooltipContent>
+                                </Tooltip>
+                              ) : (
+                                <Badge variant={statusVariants[run.status]} className="capitalize">{t(`backups.statusLabels.${run.status}`, run.status)}</Badge>
+                              )}
+                              {run.status === "failed" && run.errorMessage && (
+                                <p className="text-xs text-destructive max-w-[220px] truncate">{run.errorMessage}</p>
+                              )}
+                            </div>
                           )}
                         </TableCell>
                         <TableCell>{formatDateSafe(run.requestedAt, formatDate)}</TableCell>
@@ -1842,6 +1870,22 @@ export function InstanceBackups() {
                             </TooltipTrigger>
                             <TooltipContent>{t("backups.history.actions.restoreFromBackup")}</TooltipContent>
                           </Tooltip>
+                          {run.kind === "import" && run.status === "failed" ? (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => handleRetryImport(run)}
+                                  disabled={retryImport.isPending}
+                                  aria-label={t("backups.history.actions.retryImport")}
+                                >
+                                  <RefreshCw className="h-4 w-4" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>{t("backups.history.actions.retryImport")}</TooltipContent>
+                            </Tooltip>
+                          ) : null}
                           {run.status === "success" && run.torrentCount > 0 ? (
                             <Tooltip>
                               <DropdownMenu>
@@ -2067,7 +2111,22 @@ export function InstanceBackups() {
                             <TableCell className="max-w-sm truncate">{item.tags && item.tags.length > 0 ? item.tags.join(", ") : "—"}</TableCell>
                             <TableCell className="text-right">{formatBytes(item.sizeBytes)}</TableCell>
                             <TableCell className="text-right">
-                              {item.torrentBlob && manifestRunId ? (
+                              {!item.torrentBlob ? (
+                                <span className="text-xs text-muted-foreground">—</span>
+                              ) : item.blobStatus === "failed" ? (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Badge variant="destructive" className="capitalize">
+                                      {t("backups.blobStatus.failed")}
+                                    </Badge>
+                                  </TooltipTrigger>
+                                  {item.blobError ? <TooltipContent>{item.blobError}</TooltipContent> : null}
+                                </Tooltip>
+                              ) : item.blobStatus === "pending" ? (
+                                <Badge variant="secondary" className="capitalize">
+                                  {t("backups.blobStatus.pending")}
+                                </Badge>
+                              ) : manifestRunId ? (
                                 <Button variant="ghost" size="icon" asChild>
                                   <a
                                     href={api.getBackupTorrentDownloadUrl(instanceId!, manifestRunId, item.hash)}

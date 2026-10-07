@@ -1794,6 +1794,7 @@
         "restoreFromBackup": "Ripristina i torrent da questo backup",
         "downloadBackup": "Scarica l'archivio di backup",
         "downloadUnavailable": "Download non disponibile",
+        "retryImport": "Riprova i file .torrent mancanti",
         "deleteBackup": "Elimina questo backup"
       },
       "downloadFormats": {
@@ -1841,7 +1842,14 @@
       "backupDeleted": "Esecuzione del backup eliminata",
       "failedToDeleteBackup": "Eliminazione dell'esecuzione del backup non riuscita",
       "allBackupsDeleted": "Tutti i backup eliminati",
-      "failedToDeleteBackups": "Eliminazione dei backup non riuscita"
+      "failedToDeleteBackups": "Eliminazione dei backup non riuscita",
+      "importRetryStarted": "Recupero dei file .torrent mancanti…",
+      "failedToRetryImport": "Nuovo tentativo di recupero dei torrent non riuscito"
+    },
+    "blobStatus": {
+      "available": "Recuperato",
+      "pending": "Recupero…",
+      "failed": "Mancante"
     },
     "statusLabels": {
       "pending": "In attesa",

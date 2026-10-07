@@ -1801,6 +1801,7 @@
         "restoreFromBackup": "Torrents aus diesem Backup wiederherstellen",
         "downloadBackup": "Backup-Archiv herunterladen",
         "downloadUnavailable": "Download nicht verfügbar",
+        "retryImport": "Fehlende Torrent-Dateien erneut abrufen",
         "deleteBackup": "Dieses Backup löschen"
       },
       "downloadFormats": {
@@ -1848,7 +1849,14 @@
       "backupDeleted": "Backup-Lauf gelöscht",
       "failedToDeleteBackup": "Backup-Lauf konnte nicht gelöscht werden",
       "allBackupsDeleted": "Alle Backups gelöscht",
-      "failedToDeleteBackups": "Backups konnten nicht gelöscht werden"
+      "failedToDeleteBackups": "Backups konnten nicht gelöscht werden",
+      "importRetryStarted": "Fehlende Torrent-Dateien werden abgerufen …",
+      "failedToRetryImport": "Torrent-Abruf konnte nicht wiederholt werden"
+    },
+    "blobStatus": {
+      "available": "Wiederhergestellt",
+      "pending": "Wird abgerufen …",
+      "failed": "Fehlt"
     }
   }
 }

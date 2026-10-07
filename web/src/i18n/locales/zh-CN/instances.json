@@ -1771,6 +1771,7 @@
         "restoreFromBackup": "从此备份还原种子",
         "downloadBackup": "下载备份归档",
         "downloadUnavailable": "下载不可用",
+        "retryImport": "重试获取缺失的种子文件",
         "deleteBackup": "删除此备份"
       },
       "downloadFormats": {
@@ -1818,7 +1819,14 @@
       "backupDeleted": "备份已删除",
       "failedToDeleteBackup": "删除备份失败",
       "allBackupsDeleted": "所有备份已删除",
-      "failedToDeleteBackups": "删除备份失败"
+      "failedToDeleteBackups": "删除备份失败",
+      "importRetryStarted": "正在补取缺失的种子文件……",
+      "failedToRetryImport": "重试种子补取失败"
+    },
+    "blobStatus": {
+      "available": "已补取",
+      "pending": "补取中……",
+      "failed": "缺失"
     }
   }
 }

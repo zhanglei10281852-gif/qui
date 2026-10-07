@@ -809,6 +809,12 @@ class ApiClient {
     return response.json()
   }
 
+  async retryImportRecovery(instanceId: number, runId: number): Promise<BackupRun> {
+    return this.request<BackupRun>(`/instances/${instanceId}/backups/runs/${runId}/retry`, {
+      method: "POST",
+    })
+  }
+
   async previewRestore(
     instanceId: number,
     runId: number,
